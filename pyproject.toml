@@ -14,4 +14,4 @@ requires-python = ">=3.11"
 package-dir = {"" = "."}
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]

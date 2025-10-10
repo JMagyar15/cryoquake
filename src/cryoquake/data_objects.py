@@ -65,23 +65,23 @@ class SeismicEvent:
                 'spectral', and 'beamforming'.
         """
         if new_context == 'plot':
-            from iqvis.visualisation import EventPlot
+            from cryoquake.visualisation import EventPlot
             self.__class__ = EventPlot
         
         elif new_context == 'calculation':
-            from iqvis.event_calculation import EventCalculation
+            from cryoquake.event_calculation import EventCalculation
             self.__class__ = EventCalculation #TODO actually make this object for event attribute calculations
         
         elif new_context == 'spectral':
-            from iqvis.spec_analysis import EventSpectrum
+            from cryoquake.spec_analysis import EventSpectrum
             self.__class__ = EventSpectrum
         
         elif new_context == 'beamforming':
-            from iqvis.spatial_analysis import EventBeampower
+            from cryoquake.spatial_analysis import EventBeampower
             self.__class__ = EventBeampower
 
         elif new_context == 'polarisation':
-            from iqvis.spatial_analysis import EventPolarisation
+            from cryoquake.spatial_analysis import EventPolarisation
             self.__class__ = EventPolarisation
         
         else:
@@ -266,23 +266,23 @@ class SeismicChunk:
         present context, with unknown or unspecified context arguments send back to this base class.
         """
         if new_context == 'plot':
-            from iqvis.visualisation import ChunkPlot
+            from cryoquake.visualisation import ChunkPlot
             self.__class__ = ChunkPlot
         
         elif new_context == 'eventplot':
-            from iqvis.visualisation import ChunkEventPlot
+            from cryoquake.visualisation import ChunkEventPlot
             self.__class__ = ChunkEventPlot
         
         elif new_context == 'detect':
-            from iqvis.event_detection import ChunkDetection
+            from cryoquake.event_detection import ChunkDetection
             self.__class__ = ChunkDetection
         
         elif new_context == 'spectral':
-            from iqvis.spec_analysis import ChunkSpectrum
+            from cryoquake.spec_analysis import ChunkSpectrum
             self.__class__ = ChunkSpectrum
 
         elif new_context == 'timeseries':
-            from iqvis.time_series import TimeSeries
+            from cryoquake.time_series import TimeSeries
             self.__class__ = TimeSeries
         
         else:
@@ -295,17 +295,16 @@ class SeismicChunk:
         self.stream = sh.inv_to_waveforms(inv,self.starttime,self.endtime,w_path,buffer=buffer,print_s=False,fill=None)
         self.inv = inv
 
-    def download_waveforms(self,w_path,**options):
+    def download_waveforms(self,w_path,s_path,network,station,location,channel,**options):
         """
         Download the waveforms for specified stations and channels over the time period of the chunk. To maintain consistant file
         naming conventions, full days from 00:00:00 UTC time will be downloaded, but then trimmed to the chunk length when automatically
         attached.
         """
-        #TODO just make this a wrapper around the seismic_attributes version of get_waveforms, but then trim the data to the chunk
-        #TODO length and attach the downloaded inventory. This can then be used as an alternative to attach waveforms but when the
-        #TODO data and/or inventory have not been downloaded locally. 
-        pass
-    
+        self.stream = sh.get_waveforms(network, station, location, channel, self.starttime, self.endtime, waveform_name=w_path, station_name=s_path, **options)
+        self.stream.trim(self.starttime,self.endtime)
+
+
     def filter(self,type,**options):
         """
         Obspy filter functionality applied to the SeismicEvent object. Use exactly as obspy filter, but automatically demeans before
