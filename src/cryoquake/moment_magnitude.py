@@ -7,6 +7,25 @@ from uncertainties import ufloat
 from uncertainties.umath import cos, log10, exp
 
 
+def Misfit2Arrivals(gamma_xr,Vs=1900):
+    #takes the misfit surface Dataset and converts it to arrival windows for each station for computing moment magnitude
+    sta_lst = gamma_xr.attrs['stations'] #get the stations that were included in the inversion
+    t0 = gamma_xr.attrs['t0']
+
+    rows = []
+    for sta_code in sta_lst:
+        t1 = gamma_xr.attrs['t_'+sta_code] + t0
+        t2 = (gamma_xr.attrs['D_'+sta_code] / Vs) + t0
+
+        r = gamma_xr.attrs['D_'+sta_code]
+        dr = gamma_xr.attrs['dD_'+sta_code]
+
+        row = {'P_start':t1,'P_end':t2,'P_window':t2-t1,'R':r,'dR':dr}
+        rows.append(row)
+    arrivals = pd.DataFrame(data=rows,index=sta_lst)
+    return arrivals
+
+
 
 def SourceSpectrum(stream,arrivals,freqmin=0,freqmax=np.inf):
     f_dict = {}
@@ -125,7 +144,7 @@ def FitBruneModel(f_dict,Pxx_dict,err_dict,arrivals,freqmin,freqmax):
         if np.isnan(Pxx).any():
             results[key] = None
         else:
-            t_star_est = (arrivals['R'][key] / 3.87) / 30
+            t_star_est = (arrivals['R'][key] / 3870) / 30
             #x0 = [np.log(np.max(Pxx)),2,t_star_est]
             x0 = [np.log(np.max(Pxx)),np.log(2),t_star_est]
             #bounds = (np.array([-np.inf,freqmin,0]),np.array([np.inf,freqmax,np.inf]))
@@ -160,42 +179,42 @@ def CurveFit(disp_stream,arrivals,freqmin=0,freqmax=np.inf):
     return df
 
 
-def MomentMagnitude(disp_stream,sta_xy,freqmin=0,freqmax=np.inf):
-    output_df = CurveFit(disp_stream,sta_xy,freqmin=freqmin,freqmax=freqmax)
-    theta_dict, theta_unc_dict = IncidenceAngle(disp_stream,sta_xy,freqmin=freqmin,freqmax=freqmax)
+# def MomentMagnitude(disp_stream,sta_xy,freqmin=0,freqmax=np.inf):
+#     output_df = CurveFit(disp_stream,sta_xy,freqmin=freqmin,freqmax=freqmax)
+#     theta_dict, theta_unc_dict = IncidenceAngle(disp_stream,sta_xy,freqmin=freqmin,freqmax=freqmax)
 
-    rho = ufloat(912,10.0) #TODO find reasonable uncertainty from literature
-    v = ufloat(3870,100.0) #TODO find reasonable uncertainty from literature
-    A_rad = ufloat(0.44,0.2) #TODO think about best uncertainty estimate
-    theta_unc = {}
-    r_unc = {}
-    logomega0_unc = {}
-    M0_unc = {}
-    for sta, row in sta_xy.iterrows():
-        r_fit = row['r_fit']*1000
-        r_unc = row['sR'] * 1000
-        theta_unc[sta] = ufloat(theta_dict[sta],theta_unc_dict[sta])
-        r_unc[sta] = ufloat(r_fit,r_unc)
-        logomega0_unc[sta] = ufloat(output_df['logomega0'][sta],output_df['dlogomega0'][sta])
+#     rho = ufloat(912,10.0) #TODO find reasonable uncertainty from literature
+#     v = ufloat(3870,100.0) #TODO find reasonable uncertainty from literature
+#     A_rad = ufloat(0.44,0.2) #TODO think about best uncertainty estimate
+#     theta_unc = {}
+#     r_unc = {}
+#     logomega0_unc = {}
+#     M0_unc = {}
+#     for sta, row in sta_xy.iterrows():
+#         r_fit = row['r_fit']*1000
+#         r_unc = row['sR'] * 1000
+#         theta_unc[sta] = ufloat(theta_dict[sta],theta_unc_dict[sta])
+#         r_unc[sta] = ufloat(r_fit,r_unc)
+#         logomega0_unc[sta] = ufloat(output_df['logomega0'][sta],output_df['dlogomega0'][sta])
 
-        M0_unc[sta] = 4*np.pi*rho*v**3*r_unc[sta]*exp(logomega0_unc[sta]) / (A_rad * 2*cos(theta_unc[sta]))
+#         M0_unc[sta] = 4*np.pi*rho*v**3*r_unc[sta]*exp(logomega0_unc[sta]) / (A_rad * 2*cos(theta_unc[sta]))
 
-    M0_vals = []
-    M0_sd = []
-    for key in M0_unc.keys():
-        M0_vals.append(M0_unc[key].nominal_value)
-        M0_sd.append(M0_unc[key].std_dev)
-    M0_vals = np.array(M0_vals)
-    M0_sd = np.array(M0_sd)
+#     M0_vals = []
+#     M0_sd = []
+#     for key in M0_unc.keys():
+#         M0_vals.append(M0_unc[key].nominal_value)
+#         M0_sd.append(M0_unc[key].std_dev)
+#     M0_vals = np.array(M0_vals)
+#     M0_sd = np.array(M0_sd)
 
-    M0_ave = np.nansum(M0_vals/(M0_sd**2)) / np.nansum(1/M0_sd**2)
-    M0_ave_sd = 1 / np.sqrt(np.nansum(1/M0_sd**2))
+#     M0_ave = np.nansum(M0_vals/(M0_sd**2)) / np.nansum(1/M0_sd**2)
+#     M0_ave_sd = 1 / np.sqrt(np.nansum(1/M0_sd**2))
 
-    M0 = ufloat(M0_ave,M0_ave_sd)
-    Mw = 2/3 * log10(M0) - 6.0
-    #? split into two functions - the second is just going from the output dataframe to the moment magnitude (IE the last couple of lines here with unc est from the mean values)
-    #TODO return dataframe with full details rather than just the mean Mw, M0 - will be a row in the full dataframe output for all events...
-    return Mw, M0
+#     M0 = ufloat(M0_ave,M0_ave_sd)
+#     Mw = 2/3 * log10(M0) - 6.0
+#     #? split into two functions - the second is just going from the output dataframe to the moment magnitude (IE the last couple of lines here with unc est from the mean values)
+#     #TODO return dataframe with full details rather than just the mean Mw, M0 - will be a row in the full dataframe output for all events...
+#     return Mw, M0
 
 
 def StationMomentMagnitude(disp_stream,arrivals,freqmin=0,freqmax=np.inf):
@@ -208,7 +227,7 @@ def StationMomentMagnitude(disp_stream,arrivals,freqmin=0,freqmax=np.inf):
 
     for sta, row in station_mags.iterrows():
         logomega0 = ufloat(row['logomega0'],row['dlogomega0'])
-        r = ufloat(arrivals['R'][sta]*1000,arrivals['dR'][sta]*1000) #! need to work out best way of feeding R uncertainty in - probably through arrivals dataframe...
+        r = ufloat(arrivals['R'][sta],arrivals['dR'][sta]) #! need to work out best way of feeding R uncertainty in - probably through arrivals dataframe...
         theta = ufloat(theta_dict[sta],theta_unc_dict[sta])
         M0 = 4*np.pi*rho*v**3*r*exp(logomega0) / (A_rad * 2*cos(theta))
         Mw = 2/3 * log10(M0) - 6.0
@@ -225,31 +244,31 @@ def CombinedMomentMagnitude(station_mags):
     M0_vals = []
     M0_sd = []
 
-    fc_vals = []
-    fc_sd = []
+    #fc_vals = []
+    #fc_sd = []
     for sta, row in station_mags.iterrows():
         M0_vals.append(row['M0'])
         M0_sd.append(row['dM0'])
 
-        fc_vals.append(row['fc'])
-        fc_sd.append(row['dfc'])
+        #fc_vals.append(row['fc'])
+        #fc_sd.append(row['dfc'])
 
     M0_vals = np.array(M0_vals)
     M0_sd = np.array(M0_sd)
 
-    fc_vals = np.array(fc_vals)
-    fc_sd = np.array(fc_sd)
+    #fc_vals = np.array(fc_vals)
+    #fc_sd = np.array(fc_sd)
 
     M0_ave = np.nansum(M0_vals/(M0_sd**2)) / np.nansum(1/M0_sd**2)
     M0_ave_sd = 1 / np.sqrt(np.nansum(1/M0_sd**2))
 
-    fc_ave = np.nansum(fc_vals/(fc_sd**2)) / np.nansum(1/fc_sd**2)
-    fc_ave_sd = 1 / np.sqrt(np.nansum(1/fc_sd**2))
+    #fc_ave = np.nansum(fc_vals/(fc_sd**2)) / np.nansum(1/fc_sd**2)
+    #fc_ave_sd = 1 / np.sqrt(np.nansum(1/fc_sd**2))
 
-    fc = ufloat(fc_ave,fc_ave_sd)
+    #fc = ufloat(fc_ave,fc_ave_sd)
     M0 = ufloat(M0_ave,M0_ave_sd)
     Mw = 2/3 * log10(M0) - 6.0
 
-    return M0, Mw, fc
+    return M0, Mw#, fc
 
 

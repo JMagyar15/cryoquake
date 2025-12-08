@@ -97,16 +97,16 @@ class ChunkDetection(SeismicChunk):
                 split_stream = self.stream.split()
 
                 if method == 'nanmean':
-                    detections, _ = correlation_detector(split_stream,template_streams,thresholds,dist,template_names=template_names,similarity_func=_calc_nanmean)
+                    detections, _ = correlation_detector(split_stream,template_streams,thresholds,dist,template_names=template_names,similarity_func=_calc_nanmean,template_magnitudes=True)
                 elif method == 'n_mean':
                     if num == None:
                         num = 3
                     def simf(ccs):
                         return _calc_n_mean(ccs, num)
-                    detections, _ = correlation_detector(split_stream,template_streams,thresholds,dist,template_names=template_names,similarity_func=simf)
+                    detections, _ = correlation_detector(split_stream,template_streams,thresholds,dist,template_names=template_names,similarity_func=simf,template_magnitudes=True)
 
                 else:
-                    detections, _ = correlation_detector(split_stream,template_streams,thresholds,dist,template_names=template_names) 
+                    detections, _ = correlation_detector(split_stream,template_streams,thresholds,dist,template_names=template_names,template_magnitudes=True) 
 
                 event_rows = []
                 trace_rows = []
@@ -133,6 +133,7 @@ class ChunkDetection(SeismicChunk):
                         attribute_dict['event_id'] = event_id
                         attribute_dict['group'] = detection['template_name']
                         attribute_dict['similarity'] = detection['similarity']
+                        attribute_dict['amplitude_ratio'] = detection['amplitude_ratio']
                         attribute_rows.append(attribute_dict)
 
                         for i, trace in template.trace_rows.iterrows():
@@ -146,7 +147,7 @@ class ChunkDetection(SeismicChunk):
 
                 events = pd.DataFrame(event_rows,columns=['event_id','stations','ref_time','ref_duration','group'])
                 traces = pd.DataFrame(trace_rows,columns=['event_id','station','components','time','duration'])
-                attributes = pd.DataFrame(attribute_rows,columns=['event_id','group','similarity'])
+                attributes = pd.DataFrame(attribute_rows,columns=['event_id','group','similarity','amplitude_ratio'])
             
                 events.to_csv(os.path.join(c_path,'template_events__'+day_start.strftime("%Y%m%dT%H%M%SZ")+'__'+day_end.strftime("%Y%m%dT%H%M%SZ")+'.csv'))
                 traces.to_csv(os.path.join(c_path,'template_traces__'+day_start.strftime("%Y%m%dT%H%M%SZ")+'__'+day_end.strftime("%Y%m%dT%H%M%SZ")+'.csv'))

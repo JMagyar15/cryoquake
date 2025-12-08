@@ -8,6 +8,8 @@ from multiprocessing import Pool, shared_memory
 import pandas as pd
 from numpy.fft import rfft, irfft
 from numpy.linalg import eigvalsh, LinAlgError, eigh
+import pyproj
+import xarray as xr
 
 
 class EventBeamforming(SeismicEvent):
@@ -625,6 +627,36 @@ def CartesianStations(inv):
 
     return sta_xy, centre
 
+def EPSGStations(inv):
+    N = len(inv)
+    locations_ll = np.zeros((N,3))
+
+    i = 0
+    sta_lst = []
+    for net in inv:
+        for sta in net:
+            locations_ll[i,:] = np.array([sta.latitude,sta.longitude,sta.elevation])
+            sta_lst.append(sta.code)
+            i += 1
+
+    proj_wgs84 = pyproj.Proj(init="epsg:4326")
+    proj_epsg3031 = pyproj.Proj(init="epsg:3031")
+    x, y = pyproj.transform(proj_wgs84, proj_epsg3031, locations_ll[:,1], locations_ll[:,0])
+
+    sta_xy = np.zeros_like(locations_ll)
+
+    sta_xy[:,0] = x
+    sta_xy[:,1] = y
+    sta_xy[:,2] = locations_ll[:,2]
+
+    #now make a pairwise distance matrix for the network...
+    D = np.zeros((N,N))
+    for i in range(N):
+        for j in range(N):
+            D[i,j] = np.sqrt(np.sum((sta_xy[i,:] - sta_xy[j,:])**2))
+
+    return sta_xy, D, sta_lst
+
 
 def CartesianStationsDF(inv):
 
@@ -1148,3 +1180,241 @@ def RollingStreamModulation(Z, N, E, window_len, g=4, smooth=5, overlap=0.5, tap
     mod_E /= weight
 
     return mod_Z, mod_N, mod_E
+
+
+
+def CoalescenceBedSearch(bed_grid,stream,inv,sta=1,lta=5,decimation=10,p_detect='radial_self',s_detect='transverse_self',modulate=False,normalise=True,mod_win=0.2,mod_overlap=0.9,g=5,smooth=10,Vp=3840,Vs=1900):
+    t_grid = stream[0].times()[::decimation]
+    df = stream[0].stats.sampling_rate
+
+    #TODO eventualy give it an xarray dataset rather than the X,Y,Z grids which is an x, y grid and has bed topography as one of the data variables. It then adds another data variable for the coalescence and returns that...
+    Z_lst = []
+    N_lst = []
+    E_lst = []
+    sta_lst = []
+
+    for network in inv:
+        for station in network:
+            Z = stream.select(station=station.code,component='Z')[0].data
+            N = stream.select(station=station.code,component='1')[0].data
+            E = stream.select(station=station.code,component='2')[0].data
+
+            if modulate:
+                Z, N, E = RollingStreamModulation(Z,N,E,int(mod_win*df),g=g,smooth=smooth,overlap=mod_overlap)
+              
+            Z_lst.append(Z)
+            N_lst.append(N)
+            E_lst.append(E)
+            sta_lst.append(station.code)
+
+    Z = np.stack(Z_lst,axis=1)
+    N = np.stack(N_lst,axis=1)
+    E = np.stack(E_lst,axis=1)
+
+    #TODO assert that X, Y, Z are all the same shape...
+    summed_PS_obj = np.zeros((*bed_grid.bed_topography.shape,t_grid.size))
+
+    sta_xy, centre = EPSGStations(inv)
+
+
+    for i, x in enumerate(bed_grid.x.values):
+        for j, y in enumerate(bed_grid.y.values):
+
+            #compute the backazimuth and rotate the streams...
+            diff_x = x - sta_xy[:,0]
+            diff_y = y - sta_xy[:,1]
+
+            baz = np.arctan2(diff_x,diff_y) #uses x/y rather than y/x due to way backaz is defined from North
+        
+            R = N * np.cos(baz[None,:]) + E * np.sin(baz[None,:])
+            T = E * np.cos(baz[None,:]) - N * np.sin(baz[None,:])
+
+
+            #now get the characteristic functions for the full traces...
+            
+            P_cfts = []
+            S_cfts = []
+            for ii in range(len(inv)):
+              
+                P_cfts.append(Onset_Function(Z[:,ii],R[:,ii],T[:,ii],int(sta*df),int(lta*df),mode=p_detect))
+                S_cfts.append(Onset_Function(Z[:,ii],R[:,ii],T[:,ii],int(sta*df),int(lta*df),mode=s_detect))
+
+            P_cft = np.stack(P_cfts,axis=1)
+            S_cft = np.stack(S_cfts,axis=1)
+
+            if normalise:
+                #normalise the characteristic functions
+                norm_P = (np.sum(P_cft,axis=0)[None,:] * 1/df)
+                norm_S = (np.sum(S_cft,axis=0)[None,:] * 1/df)
+
+                if (norm_P > 1e-10).any():
+                    P_pdf = P_cft / norm_P
+                else:
+                    P_pdf = P_cft #close to zero, probably switched off S wave
+
+                if (norm_S > 1e-10).any():
+                    S_pdf = S_cft / norm_S
+                else:
+                    S_pdf = S_cft
+            
+            else:
+                P_pdf = P_cft
+                S_pdf = S_cft
+            
+
+
+            z = bed_grid.bed_topography.isel(x=i,y=j).item()
+
+            diff_z = z - sta_xy[:,2]
+
+            r = np.sqrt(diff_x**2 + diff_y**2 + diff_z**2)
+            P_tt = r / Vp
+            S_tt = r / Vs
+            P_tt = P_tt
+            S_tt = S_tt
+
+            P_tt_samp = (df*P_tt).astype(int) #number of samples for travel time
+            S_tt_samp = (df*S_tt).astype(int)  
+
+            shifted_P_cfts = []
+            shifted_S_cfts = []
+
+            for ii in range(len(inv)):
+                shifted_P_cfts.append(np.pad(P_pdf[P_tt_samp[ii]:,ii],(0,P_tt_samp[ii])))
+                shifted_S_cfts.append(np.pad(S_pdf[S_tt_samp[ii]:,ii],(0,S_tt_samp[ii])))
+
+
+            shift_P_cfts = np.stack(shifted_P_cfts,axis=1)
+            shift_S_cfts = np.stack(shifted_S_cfts,axis=1)
+
+            stacked_P = np.nansum(shift_P_cfts,axis=1)
+            stacked_S = np.nansum(shift_S_cfts,axis=1)
+            
+            summed_PS_obj[i,j,:] = (stacked_P + stacked_S)[::decimation]
+
+    coal_xr = xr.DataArray(summed_PS_obj,coords=dict(x=bed_grid.x.values,y=bed_grid.y.values,t=t_grid))
+    bed_grid = bed_grid.assign_coords(dict(t=t_grid))
+    bed_grid = bed_grid.assign(dict(coalescence = coal_xr))
+
+    return bed_grid
+
+
+def TravelTimeBedSearch(bed_grid,stream,inv,sta=1,lta=5,decimation=10,p_detect='radial_self',s_detect='transverse_self',modulate=False,normalise=True,mod_win=0.2,mod_overlap=0.9,g=5,smooth=10,Vp=3840,Vs=1900):
+    t_grid = stream[0].times()[::decimation]
+    df = stream[0].stats.sampling_rate
+
+    #TODO eventualy give it an xarray dataset rather than the X,Y,Z grids which is an x, y grid and has bed topography as one of the data variables. It then adds another data variable for the coalescence and returns that...
+    Z_lst = []
+    N_lst = []
+    E_lst = []
+    sta_lst = []
+
+    for network in inv:
+        for station in network:
+            Z = stream.select(station=station.code,component='Z')[0].data
+            N = stream.select(station=station.code,component='1')[0].data
+            E = stream.select(station=station.code,component='2')[0].data
+
+            if modulate:
+                Z, N, E = RollingStreamModulation(Z,N,E,int(mod_win*df),g=g,smooth=smooth,overlap=mod_overlap)
+              
+            Z_lst.append(Z)
+            N_lst.append(N)
+            E_lst.append(E)
+            sta_lst.append(station.code)
+
+    Z = np.stack(Z_lst,axis=1)
+    N = np.stack(N_lst,axis=1)
+    E = np.stack(E_lst,axis=1)
+
+    #TODO assert that X, Y, Z are all the same shape...
+    summed_PS_obj = np.zeros((*bed_grid.bed_topography.shape,t_grid.size))
+
+    sta_xy, centre = EPSGStations(inv)
+
+    cf = Onset_Function(Z[:,ii],N[:,ii],E[:,ii],int(sta*df),int(lta*df),mode='absolute')
+
+
+    for i, x in enumerate(bed_grid.x.values):
+        for j, y in enumerate(bed_grid.y.values):
+
+            z = bed_grid.bed_topography.isel(x=i,y=j).item()
+
+
+            #compute the backazimuth and rotate the streams...
+            diff_x = x - sta_xy[:,0]
+            diff_y = y - sta_xy[:,1]
+            diff_z = z - sta_xy[:,2]
+
+            #now get the characteristic functions for the full traces...
+            
+            P_cfts = []
+            S_cfts = []
+            for ii in range(len(inv)):
+              
+                P_cfts.append()
+                S_cfts.append(Onset_Function(Z[:,ii],R[:,ii],T[:,ii],int(sta*df),int(lta*df),mode=s_detect))
+
+            P_cft = np.stack(P_cfts,axis=1)
+            S_cft = np.stack(S_cfts,axis=1)
+
+            if normalise:
+                #normalise the characteristic functions
+                norm_P = (np.sum(P_cft,axis=0)[None,:] * 1/df)
+                norm_S = (np.sum(S_cft,axis=0)[None,:] * 1/df)
+
+                if (norm_P > 1e-10).any():
+                    P_pdf = P_cft / norm_P
+                else:
+                    P_pdf = P_cft #close to zero, probably switched off S wave
+
+                if (norm_S > 1e-10).any():
+                    S_pdf = S_cft / norm_S
+                else:
+                    S_pdf = S_cft
+            
+            else:
+                P_pdf = P_cft
+                S_pdf = S_cft
+            
+
+
+         
+
+            r = np.sqrt(diff_x**2 + diff_y**2 + diff_z**2)
+            P_tt = r / Vp
+            S_tt = r / Vs
+            P_tt = P_tt
+            S_tt = S_tt
+
+            P_tt_samp = (df*P_tt).astype(int) #number of samples for travel time
+            S_tt_samp = (df*S_tt).astype(int)  
+
+            shifted_P_cfts = []
+            shifted_S_cfts = []
+
+            for ii in range(len(inv)):
+                shifted_P_cfts.append(np.pad(P_pdf[P_tt_samp[ii]:,ii],(0,P_tt_samp[ii])))
+                shifted_S_cfts.append(np.pad(S_pdf[S_tt_samp[ii]:,ii],(0,S_tt_samp[ii])))
+
+
+            shift_P_cfts = np.stack(shifted_P_cfts,axis=1)
+            shift_S_cfts = np.stack(shifted_S_cfts,axis=1)
+
+            stacked_P = np.nansum(shift_P_cfts,axis=1)
+            stacked_S = np.nansum(shift_S_cfts,axis=1)
+            
+            summed_PS_obj[i,j,:] = (stacked_P + stacked_S)[::decimation]
+
+    coal_xr = xr.DataArray(summed_PS_obj,coords=dict(x=bed_grid.x.values,y=bed_grid.y.values,t=t_grid))
+    bed_grid = bed_grid.assign_coords(dict(t=t_grid))
+    bed_grid = bed_grid.assign(dict(coalescence = coal_xr))
+
+    return bed_grid
+
+
+
+"""
+bed scan using travel time inversion
+"""
+
