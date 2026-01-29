@@ -284,6 +284,10 @@ class SeismicChunk:
         elif new_context == 'timeseries':
             from cryoquake.time_series import TimeSeries
             self.__class__ = TimeSeries
+
+        elif new_context == 'scattering':
+            from cryoquake.deep_scattering import ScatteringSpectrum
+            self.__class__ = ScatteringSpectrum
         
         else:
             self.__class__ = SeismicChunk
