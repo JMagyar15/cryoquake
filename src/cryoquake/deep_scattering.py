@@ -11,8 +11,8 @@ from scatseisnet import ScatteringNetwork
 from cryoquake.data_objects import SeismicChunk
 from matplotlib import dates as mdates
 
-from sklearn.decomposition import FastICA, PCA, NMF
-from sklearn.cluster import AgglomerativeClustering, Birch
+from sklearn.decomposition import FastICA, PCA, NMF, SparsePCA
+from sklearn.cluster import AgglomerativeClustering, Birch, KMeans
 import umap
 
 from matplotlib.dates import DateFormatter, DayLocator, HourLocator
@@ -20,6 +20,7 @@ import copy
 import xarray as xr
 
 import fastcluster as fc
+from sknetwork.hierarchy import cut_balanced, cut_straight
 
 
 
@@ -44,8 +45,8 @@ class ScatteringSpectrum(SeismicChunk):
 
         self.scattering_coefficients = dss
 
-        self.N_times = self.timestamps.size
-        self.N_channels = self.spectra.shape[1]
+        self.N_times = len(self.timestamps)
+        self.N_channels = len(self.channel_ids)
         self.ind = np.full(self.N_times*self.N_channels,fill_value=True,dtype=bool) #initially want to consider all windows...
 
     
@@ -61,35 +62,99 @@ class ScatteringSpectrum(SeismicChunk):
         self.freqs = freqs
         self.layer_N = layer_N
 
-    def reduce_dimension(self,n_components,max_iter=1000,sqrt=False,norm=False):
+    def nmf(self,n_components,max_iter=1000,p=1,balance=True):
+        X = self.__unpack_xarray(self.scattering_coefficients)
+
+        X_mod, var = self.__preprocessX(np.copy(X),p=p)
+        self.var = var
+
+        model = NMF(n_components,solver='mu',max_iter=max_iter,beta_loss=1) #gives the option of testing exp function for approximating neg-entropy
+
+        model.fit(X_mod) #! this is doing fit_transform in one go so would be clustering the normalised spectra rather than the unnormalised where a separation would need to be made...
+
+        X_fit = self.__fitX(np.copy(X),p=p)
+        S = model.transform(X_fit)
+        #X = self.__adjustX(X,sqrt,norm)
+        #S = model.transform(X)
+        
+        H = model.components_ * self.var[None,:] #multiply by variance to get clearer physical meaning / the difference between the basis functions as they are all multiplied by sensitivity.
+
+        if balance:
+            comp_sum = np.sum(H,axis=1)
+            H = H / comp_sum[:,None]
+            S = S * comp_sum[None,:]
+         
+
+        self.S = S #as the output of the dimension reduction, this has no nan values and is smaller than the original data. It can continue to be shortened with pruning.
+        self.H = H #mixing matrix (kind of, some stuff about whittening in the documentation)...
+        #to make the xarray, will need to add back in the nans
+        S_full = np.full((self.N_times * self.N_channels,n_components),dtype=np.float32,fill_value=np.nan)
+        S_full[self.ind,:] = S.copy()
+
+        self.S_full = S_full #this is the same dimension as the original spectra, and has nan values where we have dropped windows.
+        self.S_xr = xr.DataArray(self.S_full.reshape((self.N_times,self.N_channels,-1)),coords={'t':self.scattering_coefficients.t,'channels':self.scattering_coefficients.channels,'i':np.arange(n_components)})
+
+        delattr(self,"scattering_coefficients")
+
+
+
+    def reduce_dimension(self,n_components,method='NMF',max_iter=1000,fit_norm=True,sqrt=False,norm=False,balance=True):
 
         X = self.__unpack_xarray(self.scattering_coefficients)
 
-        X = self.__adjustX(X,sqrt,norm,False) #can't do log transformation with NMF
+        X_mod = self.__adjustX(np.copy(X),sqrt,fit_norm)
 
-        model = NMF(n_components,max_iter=max_iter) #gives the option of testing exp function for approximating neg-entropy
-        S = model.fit_transform(X)
+        if method == 'NMF':
+            model = NMF(n_components,max_iter=max_iter,solver='mu',init='random',beta_loss=1) #gives the option of testing exp function for approximating neg-entropy
+        else:
+            model = FastICA(n_components,max_iter=max_iter)
+
+        model.fit(X_mod)
+
+        X = self.__adjustX(X,sqrt,norm)
+        S = model.transform(X)
+        H = model.components_
+
+        if balance:
+            if method == 'NMF':
+                #comp_length = np.linalg.norm(H,axis=1) #get length of each component
+                comp_sum = np.sum(H,axis=1)
+                H = H / comp_sum[:,None]
+                S = S * comp_sum[None,:]
+            else:
+                comp_length = np.linalg.norm(H,axis=1) #get length of each component
+                #comp_sum = np.sum(H,axis=1)
+                H = H / comp_length[:,None]
+                S = S * comp_length[None,:]
 
         self.S = S #as the output of the dimension reduction, this has no nan values and is smaller than the original data. It can continue to be shortened with pruning.
-        self.H = model.components_ #mixing matrix (kind of, some stuff about whittening in the documentation)...
+        self.H = H #mixing matrix (kind of, some stuff about whittening in the documentation)...
 
         #to make the xarray, will need to add back in the nans
         S_full = np.full((self.N_times * self.N_channels,n_components),dtype=np.float32,fill_value=np.nan)
         S_full[self.ind,:] = S.copy()
 
         self.S_full = S_full #this is the same dimension as the original spectra, and has nan values where we have dropped windows.
-        self.S_xr = xr.DataArray(self.S_full.reshape((self.N_times,self.N_channels,-1)),coords={'t':self.spectra.t,'channels':self.spectra.channels,'i':np.arange(n_components)})
+        self.S_xr = xr.DataArray(self.S_full.reshape((self.N_times,self.N_channels,-1)),coords={'t':self.scattering_coefficients.t,'channels':self.scattering_coefficients.channels,'i':np.arange(n_components)})
 
         delattr(self,"scattering_coefficients")
 
 
-    def compute_linkage(self,method='ward',metric='euclidean'):        
-        self.U = fc.linkage_vector(self.S,method=method,metric=metric)
+    def compute_linkage(self,method='ward',metric='euclidean',norm=False):        
+        S = self.S
+        if norm:
+            S /= np.sum(S,axis=1)[:,None]
+        self.U = fc.linkage_vector(S,method=method,metric=metric)
+        #self.U = fc.linkage(self.S,method=method,metric=metric)
     
-    
+
     def save_linkage(self,path,name):
         filename = os.path.join(path,self.str_name + '__' + name) #include full chunk extent in name as this step cannot be broken into daychunks...
         np.save(filename,self.U)
+
+    def load_linkage(self,path,name):
+        filename = os.path.join(path,self.str_name + '__' + name + '.npy') #include full chunk extent in name as this step cannot be broken into daychunks...
+        self.U = np.load(filename)
 
 
 
@@ -97,6 +162,7 @@ class ScatteringSpectrum(SeismicChunk):
         #use the chunk start/end times to make a file name
         filename = os.path.join(path,name + '__' + self.str_name)
         self.scattering_coefficients.to_netcdf(filename)
+
 
     def load_spectra(self,path,name='scattering_spectra'):
         #reverse process of above, just so we can then use flatten output to get back to the array form...
@@ -124,7 +190,7 @@ class ScatteringSpectrum(SeismicChunk):
 
         for daychunk in self:
 
-            filename = os.path.join(path,name + '__' + daychunk.str_name)
+            filename = os.path.join(path,name + '__features__' + daychunk.str_name)
 
             daychunk.context('scattering')
             daychunk.load_spectra(path,name=spec_name)
@@ -137,12 +203,21 @@ class ScatteringSpectrum(SeismicChunk):
             S = self.S_xr.sel(t=timestamps,channels=channels)
             S.to_netcdf(filename)
 
+        #now also save the components...
+        filename = os.path.join(path,name + '__components')
+        np.save(filename,self.H)
+
+        filename = os.path.join(path,name + '__variance')
+        np.save(filename,self.var)
+
+
+
 
     def load_dim_reduction(self,path,name='scattering_features'):
 
         day_features = []
         for daychunk in self:
-            filename = os.path.join(path,name + '__' + daychunk.str_name)
+            filename = os.path.join(path,name + '__features__' + daychunk.str_name)
             if os.path.exists(filename):
                 day = xr.load_dataarray(filename)
                 day_features.append(day)
@@ -165,10 +240,10 @@ class ScatteringSpectrum(SeismicChunk):
 
         self.S = self.S_full[self.ind,:] #as the output of the dimension reduction, this has no nan values and is smaller than the original data. It can continue to be shortened with pruning.
         
-        #TODO save the components to file and reload them here...
+        self.H = np.load(os.path.join(path,name + '__components.npy'))
+        self.var = np.load(os.path.join(path,name + '__variance.npy'))
         #self.H = model.components_ #mixing matrix (kind of, some stuff about whittening in the documentation)...
 
-    
 
     def __transform(self,segments,reduce):
         scattering_coefficients = []
@@ -234,24 +309,45 @@ class ScatteringSpectrum(SeismicChunk):
 
         return X
     
-
-    def __adjustX(self,X,sqrt,norm,log):
+    def __normaliseX(self,X):
+        mod_X = X / np.sum(X,axis=1)[:,None]
+        return mod_X
+    
+    def __powerX(self,X,p=2):
+        mod_X = X**(1/p)
+        return mod_X
+    
+    def __preprocessX(self,X,p=1,norm=True):
+        """
+        To be used before finding the basis functions from NMF.
+        """
+        X = X**(1/p) #take the power first
+        if norm:
+            X = X / np.sum(X,axis=1)[:,None] #normalise each spectrum
+        var = np.var(X,axis=0)
+        X = X / var[None,:] #rescale by variance of each scattering element
 
         if norm:
-            X = X / np.sum(X,axis=1)[:,None] #normalise the columns to get unit sum...
+            X = X / np.sum(X,axis=1)[:,None] #renormalise again
+        return X, var
+    
+    def __fitX(self,X,p=1):
+        X = X**(1/p) #take the power first
+        X = X / self.var[None,:] #rescale by variance of each scattering element
+        return X
+    
+
+    def __adjustX(self,X,sqrt,norm):
+        #TODO make these separate functions as I want to make sure it is always done in the right order, but make it for general p...
         if sqrt:
             X = np.sqrt(X)
-        if log:
-            X = np.log10(X)
+        
+        if norm:
+            X = X / np.sum(X,axis=1)[:,None] #normalise the columns to get unit sum...
 
         return X
     
 
-    #TODO move dimension reduction to here - I think it makes much more sense wrt data structures...
-
-
-#!probably move all of these functions to the above object, it's a bit messy with loading/saving to have two...
-#?or at least have the linkage in the above, and then feed the linkage to a new object for interpretation...
 
 class SpectralClustering:
     def __init__(self,spectra):#,timestamps,trace_ids):
@@ -420,3 +516,170 @@ class SpectralClustering:
             X = np.log10(X)
 
         return X
+    
+
+
+class LinkageClustering:
+    """
+    Separate class for dealing with the linkage matrix, which is the key output from the scattering spectra calculations...
+    Want to be able to chose number of clusters and properties (e.g. min cluster size) and then convert these results back into the timestamps/channels...
+    """
+    def __init__(self,chunk):
+        self.U = chunk.U
+        self.S = chunk.S_full
+        self.H = chunk.H
+        self.ind = chunk.ind
+        self.timestamps = chunk.timestamps
+        self.channel_ids = chunk.channel_ids
+        self.ind = chunk.ind
+
+        self.N_times = chunk.N_times
+        self.N_channels = chunk.N_channels
+
+
+    def k_means(self,n_clusters=10,unit_sum=True):
+        S = self.S[self.ind]
+
+        if unit_sum:
+            S /= np.sum(S,axis=1)[:,None]
+        labels = KMeans(n_clusters=n_clusters).fit_predict(S)
+        self.labels = np.full(self.N_times*self.N_channels,fill_value=-1,dtype=np.int64)
+        self.labels[self.ind] = labels + 1
+
+        self.cluster_names = np.arange(1,n_clusters+1)
+
+        group_times = {}
+        group_channels = {}
+
+        #when doing this, also want to make a link back to the timestamps and channels names of the original xarray for further analysis of windows...
+        for name in self.cluster_names:
+    
+            i_ind = np.argwhere(self.labels==name).flatten()
+
+            i, j = np.unravel_index(i_ind,(self.N_times,self.N_channels))
+
+
+            group_times[name] = np.array(self.timestamps)[i]
+            group_channels[name] = np.array(self.channel_ids)[j]
+
+        self.group_times = group_times
+        self.group_channels = group_channels
+
+        return self.labels
+
+    def prune_cluster(self,n_clusters=10,min_size=5):
+
+        distances = self.U[::-1,2] #get distances of merges in reverse order to iterate through
+        pruning = True
+
+        i = n_clusters - 1 #minimum number of iterations it could take...
+
+        self.labels = np.full(self.N_times*self.N_channels,fill_value=-1,dtype=np.int64)
+
+        while pruning:
+            labels, dendrogram = cut_straight(self.U,n_clusters=None,threshold=distances[i],return_dendrogram=True)
+            unique, counts = np.unique(labels, return_counts=True)
+
+            large_clusters = unique[(counts >= min_size)]
+
+            drop_ind = ~np.isin(labels, large_clusters)
+            labels[drop_ind] = -1 #will become cluster zero later...
+    
+            current_clusters = large_clusters.size
+
+            if (current_clusters >= n_clusters):
+                pruning = False
+
+            self.labels[self.ind] = labels + 1
+
+            i += 1
+
+        unique, counts = np.unique(self.labels, return_counts=True)
+
+        self.cluster_names = np.arange(1,n_clusters+1)
+
+        group_times = {}
+        group_channels = {}
+
+        #when doing this, also want to make a link back to the timestamps and channels names of the original xarray for further analysis of windows...
+        for name in self.cluster_names:
+    
+            i_ind = np.argwhere(self.labels==name).flatten()
+
+            i, j = np.unravel_index(i_ind,(self.N_times,self.N_channels))
+
+
+            group_times[name] = np.array(self.timestamps)[i]
+            group_channels[name] = np.array(self.channel_ids)[j]
+
+        self.group_times = group_times
+        self.group_channels = group_channels
+
+        self.dendrogram = dendrogram
+
+        return self.labels, self.dendrogram
+
+    def balanced_cluster(self,max_size):
+        self.labels = np.full(self.N_times*self.N_channels,fill_value=-1,dtype=np.int64)
+
+        labels, dendrogram = cut_balanced(self.U,max_cluster_size=max_size,return_dendrogram=True)
+
+        self.labels[self.ind] = labels + 1
+
+        unique, counts = np.unique(labels, return_counts=True)
+        n_clusters = unique.size
+        self.cluster_names = np.arange(1,n_clusters+1)
+
+        group_times = {}
+        group_channels = {}
+
+        #when doing this, also want to make a link back to the timestamps and channels names of the original xarray for further analysis of windows...
+        for name in self.cluster_names:
+    
+            i_ind = np.argwhere(self.labels==name).flatten()
+
+            i, j = np.unravel_index(i_ind,(self.N_times,self.N_channels))
+
+
+            group_times[name] = np.array(self.timestamps)[i]
+            group_channels[name] = np.array(self.channel_ids)[j]
+
+        self.group_times = group_times
+        self.group_channels = group_channels
+
+        self.dendrogram = dendrogram
+
+        return self.labels, self.dendrogram
+        
+
+    
+
+    def compute_centroids(self,cosine=False):
+        centroids = {}
+        dist = {}
+        centroid_specs = {}
+
+        for name in self.cluster_names:
+
+            ind = (self.labels==name)
+            locs = self.S[ind,:]
+
+            if cosine:
+                #for now make centroid the mean of the normalised spectra? The magnitude of this is meaningless, but only used for getting cosine distance where direction matters...
+                locs_norm = np.linalg.norm(locs,axis=1)
+                locs_unit = locs / locs_norm[:,None]  #M x n
+                centroids[name] = np.mean(locs_unit,axis=0) #1 x n
+                cent_norm = np.linalg.norm(centroids[name]) #float
+                uv = locs @ centroids[name].T #M vector
+                
+                dist[name] = 1 - (uv / (locs_norm * cent_norm)) #1 - (u.v / ||u||||v||)
+
+            else:
+                centroids[name] = np.mean(locs,axis=0)
+                dist[name] = np.sqrt(np.sum((centroids[name][None,:] - locs)**2,axis=1)) #(1 x 10) - (N x 10)
+
+            centroid_specs[name] = centroids[name][None,:] @ self.H
+        
+        self.centroids = centroids
+        self.centroid_specs = centroid_specs
+        self.dist = dist
