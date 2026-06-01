@@ -10,6 +10,8 @@ from numpy.fft import rfft, irfft
 from numpy.linalg import eigvalsh, LinAlgError, eigh
 import pyproj
 import xarray as xr
+from scipy.stats import chi2, norm
+
 
 
 class EventBeamforming(SeismicEvent):
@@ -594,11 +596,6 @@ class EventPolarisation(SeismicEvent):
         return B_mean
     
 
-
-"""
-BACKMIGRATION FUNCTIONS - eventually want to make these part of a class for SeismicEvent (or StackedEvent) but worry about this later...
-"""
-
         
 
 def Cartesian2Coords(x,y,centre):
@@ -682,282 +679,6 @@ def CartesianStationsDF(inv):
 
     return df, centre
 
-def Rotate():
-    #will have inv attached to the object so can do sta_xy
-    pass
-
-def Onset_Function(z,r,t,nsta,nlta,mode='radial_transverse'):
-
-    if mode == 'radial_transverse':
-        sta = np.cumsum(r**2)
-        lta = np.cumsum(t**2)
-    elif mode == 'radial':
-        sta = np.cumsum(r**2)
-        lta = np.cumsum(z**2 + r**2 + t**2)   
-    elif mode == 'absolute':
-        sta = np.cumsum(z**2 + r**2 + t**2)
-        lta = np.cumsum(z**2 + r**2 + t**2)
-    elif mode == 'transverse':
-        sta = np.cumsum(t**2)
-        lta = np.cumsum(z**2 + r**2 + t**2)
-    elif mode == 'transverse_radial':
-        sta = np.cumsum(t**2)
-        lta = np.cumsum(r**2)
-    elif mode == 'transverse_self':
-        sta = np.cumsum(t**2)
-        lta = np.cumsum(t**2)
-    elif mode == 'radial_self':
-        sta = np.cumsum(r**2)
-        lta = np.cumsum(r**2)
-    elif mode == 'P':
-        sta = np.cumsum(r**2 + z**2)
-        lta = np.cumsum(z**2 + r**2 * t**2)
-    elif mode == 'S':
-        sta = np.cumsum(t**2 + z**2)
-        lta = np.cumsum(z**2 + r**2 * t**2)
-    elif mode == None:
-        ratio = np.zeros_like(z)
-        return ratio #return zeros if switching off P or S coalescence
-    else:
-        sta = np.cumsum(z**2)
-        lta = np.cumsum(z**2)
-
-
-    ratio = np.zeros_like(sta)
-
-    sta[:-nsta] = sta[nsta:] - sta[:-nsta]
-    sta /= nsta
-    sta[-nsta:] = 0
-
-    #sta[nsta:] = sta[nsta:] - sta[:-nsta]
-    #sta /= nsta
-    #sta[:nsta - 1] = 0
-
-    lta[nlta:] = lta[nlta:] - lta[:-nlta]
-    lta /= nlta
-    lta[:nlta - 1] = 0
-
-    ratio[nlta:] = sta[nlta:] / lta[nlta:]
-
-    #ratio = np.nan_to_num(ratio)
-    return ratio
-
-
-def CoalescenceSurface(x_grid,y_grid,z_grid,stream,inv,sta=1,lta=5,decimation=10,p_detect='radial_self',s_detect='transverse_self',modulate=False,normalise=True,mod_win=0.2,mod_overlap=0.9,g=5,smooth=10,Vp=3.84,Vs=1.90):
-
-    t_grid = stream[0].times()[::decimation]
-    df = stream[0].stats.sampling_rate
-
-
-    Z_lst = []
-    N_lst = []
-    E_lst = []
-    sta_lst = []
-
-    for network in inv:
-        for station in network:
-            Z = stream.select(station=station.code,component='Z')[0].data
-            N = stream.select(station=station.code,component='1')[0].data
-            E = stream.select(station=station.code,component='2')[0].data
-
-            if modulate:
-                Z, N, E = RollingStreamModulation(Z,N,E,int(mod_win*df),g=g,smooth=smooth,overlap=mod_overlap)
-              
-            Z_lst.append(Z)
-            N_lst.append(N)
-            E_lst.append(E)
-            sta_lst.append(station.code)
-
-    Z = np.stack(Z_lst,axis=1)
-    N = np.stack(N_lst,axis=1)
-    E = np.stack(E_lst,axis=1)
-
-    summed_PS_obj = np.zeros((x_grid.size,y_grid.size,z_grid.size,t_grid.size))
-    sta_xy, centre = CartesianStations(inv)
-
-
-    for i, e in enumerate(x_grid):
-        for j, n in enumerate(y_grid):
-            #compute the backazimuth and rotate the streams...
-            diff_e = e - sta_xy[:,0]
-            diff_n = n - sta_xy[:,1]
-
-            baz = np.arctan2(diff_e,diff_n) #uses x/y rather than y/x due to way backaz is defined from North
-        
-            R = N * np.cos(baz[None,:]) + E * np.sin(baz[None,:])
-            T = E * np.cos(baz[None,:]) - N * np.sin(baz[None,:])
-
-
-            #now get the characteristic functions for the full traces...
-            
-            P_cfts = []
-            S_cfts = []
-            for ii in range(len(inv)):
-              
-                P_cfts.append(Onset_Function(Z[:,ii],R[:,ii],T[:,ii],int(sta*df),int(lta*df),mode=p_detect))
-                S_cfts.append(Onset_Function(Z[:,ii],R[:,ii],T[:,ii],int(sta*df),int(lta*df),mode=s_detect))
-
-            P_cft = np.stack(P_cfts,axis=1)
-            S_cft = np.stack(S_cfts,axis=1)
-
-            if normalise:
-                #normalise the characteristic functions
-                norm_P = (np.sum(P_cft,axis=0)[None,:] * 1/df)
-                norm_S = (np.sum(S_cft,axis=0)[None,:] * 1/df)
-
-                if (norm_P > 1e-10).any():
-                    P_pdf = P_cft / norm_P
-                else:
-                    P_pdf = P_cft #close to zero, probably switched off S wave
-
-                if (norm_S > 1e-10).any():
-                    S_pdf = S_cft / norm_S
-                else:
-                    S_pdf = S_cft
-            
-            else:
-                P_pdf = P_cft
-                S_pdf = S_cft
-            
-
-
-            for k, z in enumerate(z_grid):
-                diff_z = z - sta_xy[:,2]
-
-                r = np.sqrt(diff_e**2 + diff_n**2 + diff_z**2)
-                P_tt = r / Vp
-                S_tt = r / Vs
-                P_tt = P_tt
-                S_tt = S_tt
-
-                P_tt_samp = (df*P_tt).astype(int) #number of samples for travel time
-                S_tt_samp = (df*S_tt).astype(int)  
-
-                shifted_P_cfts = []
-                shifted_S_cfts = []
-
-                for ii in range(len(inv)):
-                    shifted_P_cfts.append(np.pad(P_pdf[P_tt_samp[ii]:,ii],(0,P_tt_samp[ii])))
-                    shifted_S_cfts.append(np.pad(S_pdf[S_tt_samp[ii]:,ii],(0,S_tt_samp[ii])))
-
-
-                shift_P_cfts = np.stack(shifted_P_cfts,axis=1)
-                shift_S_cfts = np.stack(shifted_S_cfts,axis=1)
-
-                stacked_P = np.nansum(shift_P_cfts,axis=1)
-                stacked_S = np.nansum(shift_S_cfts,axis=1)
-                
-                summed_PS_obj[i,j,k,:] = (stacked_P + stacked_S)[::decimation]
-
-    return x_grid, y_grid, z_grid, t_grid, summed_PS_obj, sta_xy, centre
-
-
-
-from scipy import ndimage
-
-def ConnectedCoalescenceMask(coal_surface,thresh=0.5):
-    p = np.squeeze(coal_surface)
-    n_dim = len(p.shape) #number of dimensions for the coalescence surface
-    max_coal = p.max()
-
-    # MAP voxel
-    imax = np.unravel_index(np.argmax(p), p.shape)
-
-    threshold = thresh * max_coal #half maximum cutoff value
-
-    # Initial mask (may include ties at the threshold)
-    mask = p >= threshold
-
-    structure = ndimage.generate_binary_structure(rank=n_dim, connectivity=1)
-    labels, nlab = ndimage.label(mask, structure=structure)
-    if nlab == 0:
-        # Degenerate edge case: no voxels passed the threshold due to numerical weirdness
-        comp = np.zeros_like(mask, dtype=bool)
-    else:
-        comp_label = labels[imax]
-        comp = (labels == comp_label)
-
-    mask = comp
-
-    return mask
-
-def interval_from_projection(proj_bool, coords):
-    idx = np.flatnonzero(proj_bool)
-    if idx.size == 0:
-        return (np.nan, np.nan)
-    return (coords[idx.min()], coords[idx.max()])
-
-def wstats(coords, weights):
-    s = weights.sum()
-    if s <= 0:
-        return (np.nan, np.nan)
-    w = weights / s
-    mu = (coords * w).sum()
-    var = ((coords - mu)**2 * w).sum()
-    return float(mu), float(np.sqrt(max(var, 0.0)))
-
-
-def UncertaintyQuantBackM(x_grid,y_grid,z_grid,t_grid,inv,coalescence,contours=[0.75,0.5],time_slice=True):
-    
-    sta_xy, _ = CartesianStationsDF(inv)
-    coord_lst = [x_grid,y_grid,z_grid,t_grid]
-
-    if time_slice:
-        x_ind, y_ind, z_ind, t_ind = np.unravel_index(np.argmax(coalescence),coalescence.shape)
-        coal_surf = coalescence[:,:,:,t_ind]
-    else:
-        coal_surf = coalescence
-
-    X, Y, Z = np.meshgrid(x_grid,y_grid,z_grid) #for computing the distance to each station
-
-    dX = (sta_xy['X'].to_numpy()[:,None,None,None] - X[None,:,:,:])
-    dY = (sta_xy['Y'].to_numpy()[:,None,None,None] - Y[None,:,:,:])
-    dZ = (sta_xy['Z'].to_numpy()[:,None,None,None] - Z[None,:,:,:])
-
-    dR = np.sqrt(dX**2 + dY**2 + dZ**2) #[station,X,Y,Z]
-
-    r_fit = dR[:,x_ind,y_ind,z_ind] #get the distance to each station for the optimal location
-
-    fit = (x_grid[x_ind],y_grid[y_ind],z_grid[z_ind],t_grid[t_ind],r_fit)
-
-    centres = {}
-    uncertainties = {}
-
-    for thresh in contours:
-        centres[thresh] = []
-        uncertainties[thresh] = []
-
-        mask = ConnectedCoalescenceMask(coal_surf,thresh=thresh)
-        p_mask = np.where(mask, coal_surf, 0.0)
-
-
-        #do the intervals, projections, and uncertainties on each coordinate from the masked coalescence.
-        all_coords = set([i for i in range(len(mask.shape))])
-
-        for coord in all_coords:
-            coord_grid = coord_lst[coord]
-            sum_coords = tuple(all_coords - {coord}) #drop the current coordinate for the summation axes
-
-            marg = p_mask.sum(axis=sum_coords)
-
-            mu, s = wstats(coord_grid, marg)
-
-            centres[thresh].append(mu)
-            uncertainties[thresh].append(s)     
-
-        cR = []
-        sR = []
-        for i in range(dR.shape[0]): #loop through the stations
-            staR = dR[i,:,:,:]
-
-            mu, s = wstats(staR,p_mask) #get the centre and std for the radial distance at this station
-            cR.append(mu)
-            sR.append(s)
-        centres[thresh].append(cR)
-        uncertainties[thresh].append(sR)
-
-    return fit, uncertainties, centres
-
 
 def ArrivalTimes(inv,fit,uncertainties,Vp=3.87,Vs=1.90):
     """
@@ -983,126 +704,8 @@ def ArrivalTimes(inv,fit,uncertainties,Vp=3.87,Vs=1.90):
 
 
 
-def StreamModulation(Z, N, E, window_len, g=4, smooth=5):
-    """
-    Apply polarisation-based modulation to 3-component seismic data.
-    
-    Parameters
-    ----------
-    Z, N, E : np.ndarray
-        1D arrays with the three component seismic data.
-    window_len : int
-        Length of time-domain window in samples.
-    g : float
-        Exponent for polarisation weighting.
-    smooth : int
-        Half-width of frequency smoothing in bins (default 5).
-    
-    Returns
-    -------
-    mod_Z, mod_N, mod_E : np.ndarray
-        Modulated Z, N, E arrays.
-    """
-
-    total_length = Z.size
-    mod_Z = np.zeros_like(Z)
-    mod_Zn = np.zeros_like(Z)
-    mod_Ze = np.zeros_like(Z)
-    mod_N = np.zeros_like(N)
-    mod_E = np.zeros_like(E)
-
-    window_start = 0
-    window_end = window_start + window_len
-
-    while window_end <= total_length:
-        # Slice windowed time series
-        window_Z = Z[window_start:window_end]
-        window_N = N[window_start:window_end]
-        window_E = E[window_start:window_end]
-
-        # FFT
-        Zf = rfft(window_Z)
-        Nf = rfft(window_N)
-        Ef = rfft(window_E)
-
-        # Shape (n_freq, 3)
-        M = np.stack((Zf, Nf, Ef), axis=1)
-
-        n_freq = M.shape[0]
-        P = np.zeros(n_freq)
-        vN = np.zeros(n_freq)
-        vE = np.zeros(n_freq)
-
-        # For each frequency bin, build cross-spectral matrix averaged over neighbours
-        for f in range(n_freq):
-            lo = max(0, f - smooth)
-            hi = min(n_freq, f + smooth + 1)
-            band = M[lo:hi]  # (bandwidth, 3)
-
-            # Cross-spectral density matrix (3x3)
-            S = np.einsum("bi,bj->ij", band, band.conj()) / band.shape[0]
-
-            try:
-                eig_vals, eig_vecs = eigh(S)
-                v1 = np.abs(eig_vecs[:,-1]) #principle eigenvector magnitude
-                v1_proj = v1[1:] #drop the vertical component
-                v1_proj /= np.sqrt(np.sum(v1_proj**2)) #make sure it is normalised
-                vN[f] = v1_proj[0]
-                vE[f] = v1_proj[1]
-                P[f] = eig_vals[-1] / eig_vals.sum() #TODO can we do something with the eigenvector by supressing the other directions? Take each component of normalised principle eigenvalue and have directional dependent P
-            except LinAlgError:
-                P[f] = np.nan #missing data, fill out with nans
-                vN[f] = np.nan
-                vE[f] = np.nan
-            
-
-        # Apply polarisation weighting
-        Zf_mod = Zf * (P**g)
-        Znf_mod = Zf * (P**g) * vN
-        Zef_mod = Zf * (P**g) * vE
-        Nf_mod = Nf * (P**g)
-        Ef_mod = Ef * (P**g)
-
-        # IFFT back to time domain
-        mod_Z[window_start:window_end] = irfft(Zf_mod, n=window_len)
-        mod_Zn[window_start:window_end] = irfft(Znf_mod, n=window_len)
-        mod_Ze[window_start:window_end] = irfft(Zef_mod, n=window_len)
-        mod_N[window_start:window_end] = irfft(Nf_mod, n=window_len)
-        mod_E[window_start:window_end] = irfft(Ef_mod, n=window_len)
-
-        # Advance to next window
-        window_start += window_len
-        window_end += window_len
-
-    return mod_Z, mod_Zn, mod_Ze, mod_N, mod_E
-
-
-
 def RollingStreamModulation(Z, N, E, window_len, g=4, smooth=5, overlap=0.5, taper="hann"):
-    """
-    Apply polarisation-based modulation to 3-component seismic data.
-
-    Parameters
-    ----------
-    Z, N, E : np.ndarray
-        1D arrays with the three component seismic data.
-    window_len : int
-        Length of time-domain window in samples.
-    g : float
-        Exponent for polarisation weighting.
-    smooth : int
-        Half-width of frequency smoothing in bins (default 5).
-    overlap : float
-        Fraction of overlap between windows (0–1). Default 0.5 (50%).
-    taper : str or None
-        Window function to apply before FFT. Options: 'hann', 'hamming', None.
-
-    Returns
-    -------
-    mod_Z, mod_N, mod_E : np.ndarray
-        Modulated Z, N, E arrays.
-    """
-
+   
     total_length = Z.size
     mod_Z = np.zeros_like(Z, dtype=float)
     mod_N = np.zeros_like(N, dtype=float)
@@ -1183,238 +786,218 @@ def RollingStreamModulation(Z, N, E, window_len, g=4, smooth=5, overlap=0.5, tap
 
 
 
-def CoalescenceBedSearch(bed_grid,stream,inv,sta=1,lta=5,decimation=10,p_detect='radial_self',s_detect='transverse_self',modulate=False,normalise=True,mod_win=0.2,mod_overlap=0.9,g=5,smooth=10,Vp=3840,Vs=1900):
-    t_grid = stream[0].times()[::decimation]
-    df = stream[0].stats.sampling_rate
-
-    #TODO eventualy give it an xarray dataset rather than the X,Y,Z grids which is an x, y grid and has bed topography as one of the data variables. It then adds another data variable for the coalescence and returns that...
-    Z_lst = []
-    N_lst = []
-    E_lst = []
-    sta_lst = []
-
-    for network in inv:
-        for station in network:
-            Z = stream.select(station=station.code,component='Z')[0].data
-            N = stream.select(station=station.code,component='1')[0].data
-            E = stream.select(station=station.code,component='2')[0].data
-
-            if modulate:
-                Z, N, E = RollingStreamModulation(Z,N,E,int(mod_win*df),g=g,smooth=smooth,overlap=mod_overlap)
-              
-            Z_lst.append(Z)
-            N_lst.append(N)
-            E_lst.append(E)
-            sta_lst.append(station.code)
-
-    Z = np.stack(Z_lst,axis=1)
-    N = np.stack(N_lst,axis=1)
-    E = np.stack(E_lst,axis=1)
-
-    #TODO assert that X, Y, Z are all the same shape...
-    summed_PS_obj = np.zeros((*bed_grid.bed_topography.shape,t_grid.size))
-
-    sta_xy, centre = EPSGStations(inv)
-
-
-    for i, x in enumerate(bed_grid.x.values):
-        for j, y in enumerate(bed_grid.y.values):
-
-            #compute the backazimuth and rotate the streams...
-            diff_x = x - sta_xy[:,0]
-            diff_y = y - sta_xy[:,1]
-
-            baz = np.arctan2(diff_x,diff_y) #uses x/y rather than y/x due to way backaz is defined from North
-        
-            R = N * np.cos(baz[None,:]) + E * np.sin(baz[None,:])
-            T = E * np.cos(baz[None,:]) - N * np.sin(baz[None,:])
-
-
-            #now get the characteristic functions for the full traces...
-            
-            P_cfts = []
-            S_cfts = []
-            for ii in range(len(inv)):
-              
-                P_cfts.append(Onset_Function(Z[:,ii],R[:,ii],T[:,ii],int(sta*df),int(lta*df),mode=p_detect))
-                S_cfts.append(Onset_Function(Z[:,ii],R[:,ii],T[:,ii],int(sta*df),int(lta*df),mode=s_detect))
-
-            P_cft = np.stack(P_cfts,axis=1)
-            S_cft = np.stack(S_cfts,axis=1)
-
-            if normalise:
-                #normalise the characteristic functions
-                norm_P = (np.sum(P_cft,axis=0)[None,:] * 1/df)
-                norm_S = (np.sum(S_cft,axis=0)[None,:] * 1/df)
-
-                if (norm_P > 1e-10).any():
-                    P_pdf = P_cft / norm_P
-                else:
-                    P_pdf = P_cft #close to zero, probably switched off S wave
-
-                if (norm_S > 1e-10).any():
-                    S_pdf = S_cft / norm_S
-                else:
-                    S_pdf = S_cft
-            
-            else:
-                P_pdf = P_cft
-                S_pdf = S_cft
-            
-
-
-            z = bed_grid.bed_topography.isel(x=i,y=j).item()
-
-            diff_z = z - sta_xy[:,2]
-
-            r = np.sqrt(diff_x**2 + diff_y**2 + diff_z**2)
-            P_tt = r / Vp
-            S_tt = r / Vs
-            P_tt = P_tt
-            S_tt = S_tt
-
-            P_tt_samp = (df*P_tt).astype(int) #number of samples for travel time
-            S_tt_samp = (df*S_tt).astype(int)  
-
-            shifted_P_cfts = []
-            shifted_S_cfts = []
-
-            for ii in range(len(inv)):
-                shifted_P_cfts.append(np.pad(P_pdf[P_tt_samp[ii]:,ii],(0,P_tt_samp[ii])))
-                shifted_S_cfts.append(np.pad(S_pdf[S_tt_samp[ii]:,ii],(0,S_tt_samp[ii])))
-
-
-            shift_P_cfts = np.stack(shifted_P_cfts,axis=1)
-            shift_S_cfts = np.stack(shifted_S_cfts,axis=1)
-
-            stacked_P = np.nansum(shift_P_cfts,axis=1)
-            stacked_S = np.nansum(shift_S_cfts,axis=1)
-            
-            summed_PS_obj[i,j,:] = (stacked_P + stacked_S)[::decimation]
-
-    coal_xr = xr.DataArray(summed_PS_obj,coords=dict(x=bed_grid.x.values,y=bed_grid.y.values,t=t_grid))
-    bed_grid = bed_grid.assign_coords(dict(t=t_grid))
-    bed_grid = bed_grid.assign(dict(coalescence = coal_xr))
-
-    return bed_grid
-
-
-def TravelTimeBedSearch(bed_grid,stream,inv,sta=1,lta=5,decimation=10,p_detect='radial_self',s_detect='transverse_self',modulate=False,normalise=True,mod_win=0.2,mod_overlap=0.9,g=5,smooth=10,Vp=3840,Vs=1900):
-    t_grid = stream[0].times()[::decimation]
-    df = stream[0].stats.sampling_rate
-
-    #TODO eventualy give it an xarray dataset rather than the X,Y,Z grids which is an x, y grid and has bed topography as one of the data variables. It then adds another data variable for the coalescence and returns that...
-    Z_lst = []
-    N_lst = []
-    E_lst = []
-    sta_lst = []
-
-    for network in inv:
-        for station in network:
-            Z = stream.select(station=station.code,component='Z')[0].data
-            N = stream.select(station=station.code,component='1')[0].data
-            E = stream.select(station=station.code,component='2')[0].data
-
-            if modulate:
-                Z, N, E = RollingStreamModulation(Z,N,E,int(mod_win*df),g=g,smooth=smooth,overlap=mod_overlap)
-              
-            Z_lst.append(Z)
-            N_lst.append(N)
-            E_lst.append(E)
-            sta_lst.append(station.code)
-
-    Z = np.stack(Z_lst,axis=1)
-    N = np.stack(N_lst,axis=1)
-    E = np.stack(E_lst,axis=1)
-
-    #TODO assert that X, Y, Z are all the same shape...
-    summed_PS_obj = np.zeros((*bed_grid.bed_topography.shape,t_grid.size))
-
-    sta_xy, centre = EPSGStations(inv)
-
-    cf = Onset_Function(Z[:,ii],N[:,ii],E[:,ii],int(sta*df),int(lta*df),mode='absolute')
-
-
-    for i, x in enumerate(bed_grid.x.values):
-        for j, y in enumerate(bed_grid.y.values):
-
-            z = bed_grid.bed_topography.isel(x=i,y=j).item()
-
-
-            #compute the backazimuth and rotate the streams...
-            diff_x = x - sta_xy[:,0]
-            diff_y = y - sta_xy[:,1]
-            diff_z = z - sta_xy[:,2]
-
-            #now get the characteristic functions for the full traces...
-            
-            P_cfts = []
-            S_cfts = []
-            for ii in range(len(inv)):
-              
-                P_cfts.append()
-                S_cfts.append(Onset_Function(Z[:,ii],R[:,ii],T[:,ii],int(sta*df),int(lta*df),mode=s_detect))
-
-            P_cft = np.stack(P_cfts,axis=1)
-            S_cft = np.stack(S_cfts,axis=1)
-
-            if normalise:
-                #normalise the characteristic functions
-                norm_P = (np.sum(P_cft,axis=0)[None,:] * 1/df)
-                norm_S = (np.sum(S_cft,axis=0)[None,:] * 1/df)
-
-                if (norm_P > 1e-10).any():
-                    P_pdf = P_cft / norm_P
-                else:
-                    P_pdf = P_cft #close to zero, probably switched off S wave
-
-                if (norm_S > 1e-10).any():
-                    S_pdf = S_cft / norm_S
-                else:
-                    S_pdf = S_cft
-            
-            else:
-                P_pdf = P_cft
-                S_pdf = S_cft
-            
-
-
-         
-
-            r = np.sqrt(diff_x**2 + diff_y**2 + diff_z**2)
-            P_tt = r / Vp
-            S_tt = r / Vs
-            P_tt = P_tt
-            S_tt = S_tt
-
-            P_tt_samp = (df*P_tt).astype(int) #number of samples for travel time
-            S_tt_samp = (df*S_tt).astype(int)  
-
-            shifted_P_cfts = []
-            shifted_S_cfts = []
-
-            for ii in range(len(inv)):
-                shifted_P_cfts.append(np.pad(P_pdf[P_tt_samp[ii]:,ii],(0,P_tt_samp[ii])))
-                shifted_S_cfts.append(np.pad(S_pdf[S_tt_samp[ii]:,ii],(0,S_tt_samp[ii])))
-
-
-            shift_P_cfts = np.stack(shifted_P_cfts,axis=1)
-            shift_S_cfts = np.stack(shifted_S_cfts,axis=1)
-
-            stacked_P = np.nansum(shift_P_cfts,axis=1)
-            stacked_S = np.nansum(shift_S_cfts,axis=1)
-            
-            summed_PS_obj[i,j,:] = (stacked_P + stacked_S)[::decimation]
-
-    coal_xr = xr.DataArray(summed_PS_obj,coords=dict(x=bed_grid.x.values,y=bed_grid.y.values,t=t_grid))
-    bed_grid = bed_grid.assign_coords(dict(t=t_grid))
-    bed_grid = bed_grid.assign(dict(coalescence = coal_xr))
-
-    return bed_grid
-
-
-
 """
 bed scan using travel time inversion
 """
 
+
+
+
+def DistXr(inv,bed_grid):
+    xlin = bed_grid.x.to_numpy()
+    ylin = bed_grid.y.to_numpy()
+    d = xr.Dataset(coords=dict(x=xlin,y=ylin))
+    dz = xr.Dataset(coords=dict(x=xlin,y=ylin))
+
+    proj_wgs84 = pyproj.Proj(init="epsg:4326")
+    proj_epsg3031 = pyproj.Proj(init="epsg:3031")
+
+    for network in inv:
+        for station in network:
+            lat, lon, sta_z, = station.latitude,station.longitude,station.elevation
+            sta_x, sta_y = pyproj.transform(proj_wgs84, proj_epsg3031, lon, lat)
+
+            dX = d.x - sta_x
+            dY = d.y - sta_y
+            dZ = bed_grid.bed_topography - sta_z
+
+            dz = dz.assign({station.code:np.abs(dZ)}) #difference in elevation between station and bed
+                    
+            dist = (dX**2 + dY**2 + dZ**2)**(0.5)
+
+            d = d.assign({station.code:dist})
+    
+    sigma_D = bed_grid.bed_uncertainty * (dz / d)
+    return d, sigma_D
+
+
+def BedScan(inv,p_picks,bed_grid,V=3900,sigma_V=100,Delta=10000,bed_error=True,no_model_error=False):
+    """
+    inv: obspy inventory with the stations
+    p_picks: pandas dataframe with the 95% bounds on the p arrival time.
+    bed_grid: xarray with the desired x and y coordinates for the grid search, and the bed topography (with uncertainties)
+    """
+
+    xlin = bed_grid.x.to_numpy()
+    ylin = bed_grid.y.to_numpy()
+
+    d, sigma_D = DistXr(inv,bed_grid)
+
+    
+
+    #h = xr.Dataset(coords=dict(x=xlin,y=ylin))
+    #d = xr.Dataset(coords=dict(x=xlin,y=ylin))
+    #dz = xr.Dataset(coords=dict(x=xlin,y=ylin))
+    gamma = xr.Dataset(coords=dict(x=xlin,y=ylin))
+
+    h = d / V
+
+    if ~bed_error:
+        sigma_D = 0.0 * sigma_D
+
+    sta_xy, D, sta_lst = EPSGStations(inv)
+
+    #turn the above picks and uncertainties into arrays and mark missing data
+    mu_P = np.zeros(len(sta_lst))
+    sigma_P = np.zeros(len(sta_lst))
+    pick_ind = np.full(len(sta_lst),fill_value=True)
+    pick_sta = []
+    for i, sta_code in enumerate(sta_lst):
+        mu_P[i] = p_picks['mu'][sta_code]
+        sigma_P[i] = p_picks['sigma'][sta_code]
+
+        if np.isnan(p_picks['mu'][sta_code]):
+            pick_ind[i] = False
+        else:
+            pick_sta.append(sta_code)
+
+    mu_P = mu_P[pick_ind]
+    sigma_P = sigma_P[pick_ind]
+    D = D[pick_ind,:][:,pick_ind]
+    N = np.sum(pick_ind) #number of stations where we have picks
+
+    C_t = np.zeros((xlin.size,ylin.size,N,N))
+    C_T = np.zeros((xlin.size,ylin.size,N,N))
+
+    for i_s, sta_i in enumerate(pick_sta):
+
+        C_t[:,:,i_s,i_s] += sigma_P[i_s]**2 #include the picking error to the diagonals
+
+        for j_s, sta_j in enumerate(pick_sta):
+            
+            h_i = h.variables[sta_i].to_numpy()
+            h_j = h.variables[sta_j].to_numpy()
+
+            D_i = d.variables[sta_i].to_numpy()
+            D_j = d.variables[sta_j].to_numpy()
+
+            sigma_D_i = sigma_D.variables[sta_i].to_numpy()
+            sigma_D_j = sigma_D.variables[sta_j].to_numpy()
+
+            rho_D = 1.0
+            rho_V = np.exp(-0.5 * D[i_s,j_s]**2 / (Delta**2))
+
+            if i_s == j_s:
+                rho_DV = 1.0
+            else:
+                rho_DV = 0.0
+            
+            C_T[:,:,i_s,j_s] = h_i * h_j * (((rho_D * sigma_D_i * sigma_D_j) / (D_i * D_j))**2 + 
+                                            ((rho_DV * sigma_D_i * sigma_V) / (D_j * V))**2 +
+                                            ((rho_DV * sigma_D_j * sigma_V) / (D_i * V))**2 + 
+                                            ((rho_V * sigma_V**2)/(V**2))**2)**(0.5)
+
+    
+
+    if no_model_error:
+        C = C_t
+    else:
+        C = C_t + C_T
+
+    P = np.linalg.inv(C) # N x M x S x S
+
+    p = np.sum(P,axis=2)
+    K = np.sum(P,axis=(2,3))
+
+    t_ave = np.zeros((xlin.size,ylin.size,N))
+    h_ave = np.zeros((xlin.size,ylin.size,N))
+
+    for j, sta_code in enumerate(pick_sta):
+        t_ave[:,:,j] = (p[:,:,j] * mu_P[j]) / K
+
+        h_ave[:,:,j] = (p[:,:,j] * h.variables[sta_code].to_numpy()) / K
+        
+    t_ave = t_ave.sum(axis=2)
+    h_ave = h_ave.sum(axis=2)
+
+    t_tilde = np.zeros((xlin.size,ylin.size,N))
+    h_tilde = np.zeros((xlin.size,ylin.size,N))
+
+    for i, sta_code in enumerate(pick_sta):
+        t_tilde[:,:,i] = mu_P[i] - t_ave
+        h_tilde[:,:,i] = h.variables[sta_code].to_numpy() - h_ave
+
+    resid = t_tilde - h_tilde
+    res = np.squeeze(P @ resid[:,:,:,None]) # N x M x S
+    misfit = np.squeeze(resid[:,:,None,:] @ res[:,:,:,None]) #resid is N x M x S
+    gamma_arr = (N-2) * (misfit - misfit.min()) / misfit.min() #compute the contour function from the misfit.
+
+    #convert gamma to a xarray dataarray...
+
+    gamma = gamma.assign({'gamma':(('x','y'),gamma_arr), 'chi2':(('x','y'),misfit)})
+
+    #work out t0 for the optimal solution and attach this to the dataset
+
+    x_ind, y_ind = np.unravel_index(np.argmin(gamma_arr),gamma_arr.shape)
+    x0 = xlin[x_ind]
+    y0 = ylin[y_ind]    
+    
+    fit = h_tilde[x_ind,y_ind,:] + t_ave[x_ind,y_ind]
+
+    h_fit = np.zeros(N)
+
+
+    chi2_norm = (misfit / misfit.min()) * (N-2) 
+    pdf = chi2.pdf(chi2_norm,N-2) #get the unnormalised pdf structure
+    pdf /= pdf.sum()
+    pdf_flat = pdf.flatten()
+
+
+    for i, sta_code in enumerate(pick_sta):
+        gamma.attrs['D_'+sta_code] = d.isel(x=x_ind,y=y_ind).variables[sta_code].values
+        gamma.attrs['t_'+sta_code] = d.isel(x=x_ind,y=y_ind).variables[sta_code].values / V
+        h_fit[i] = h.isel(x=x_ind,y=y_ind).variables[sta_code].values
+
+        r_i = d.variables[sta_code]
+
+        r_i_flat = r_i.to_numpy().flatten()
+
+        ind_sort = np.argsort(r_i_flat)
+
+        r_i_sort = r_i_flat[ind_sort]
+        chi2_sort = pdf_flat[ind_sort]
+
+        cdf_r = np.cumsum(chi2_sort)
+        cdf_r /= cdf_r[-1]
+
+        ci = r_i_sort[(cdf_r >= 0.025) & (cdf_r <= 0.975)]
+        sigma = (ci[-1] - ci[0]) / 4
+        gamma.attrs['dD_'+sta_code] = sigma
+
+
+    t0 = np.mean(fit - h_fit) #all these values are actually the same (as they should be)
+
+    gamma.attrs['t0'] = t0
+    gamma.attrs['x0'] = x0
+    gamma.attrs['y0'] = y0
+
+
+    pdf_x = np.sum(pdf,axis=1)
+    cdf_x = np.cumsum(pdf_x)
+    ci_x = xlin[(cdf_x >= 0.025) & (cdf_x <= 0.975)]
+    sigma_x = (ci_x[-1] - ci_x[0]) / 4
+
+    pdf_y = np.sum(pdf,axis=0)
+    cdf_y = np.cumsum(pdf_y)
+    ci_y = ylin[(cdf_y >= 0.025) & (cdf_y <= 0.975)]
+    sigma_y = (ci_y[-1] - ci_y[0]) / 4
+
+    gamma.attrs['dx'] = sigma_x
+    gamma.attrs['dy'] = sigma_y
+
+    gamma.attrs['stations'] = pick_sta
+
+
+    gamma = gamma.assign({'pdf':(('x','y'),pdf)})
+
+    return gamma

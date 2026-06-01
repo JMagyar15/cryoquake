@@ -35,15 +35,11 @@ def SourceSpectrum(stream,arrivals,freqmin=0,freqmax=np.inf):
 
     for sta, row in arrivals.iterrows():
         tr = stream.select(station=sta,component='Z')[0]
-        #tr.stats.starttime = UTCDateTime(2019,1,10)
-        #tr.remove_response(inv,output='DISP',pre_filt=[0.1,0.1,500,500])
         fs = tr.stats.sampling_rate
         N_window = int((row['P_end'] - row['P_start'])*fs)
         N_start = int(row['P_start']*fs)
 
         #now compute the PSD for the window
-        #tr_window = tr.data[N_start:N_start+N_window] * window
-        #f, Pxx = periodogram(tr_window,fs=fs,scaling='spectrum')
 
         psd = MTSpec(tr.data[N_start:N_start+N_window],dt=1/fs)
         f, Pxx = psd.rspec()
@@ -100,6 +96,8 @@ def IncidenceAngle(stream,sta_xy,freqmin=0,freqmax=np.inf):
             Z_trim = Zabs[N_start:N_start+N_window]
             R_trim = Rabs[N_start:N_start+N_window]
 
+            #below code is based off obspy particle motion polarization code https://github.com/obspy/obspy/blob/master/obspy/signal/polarization.py
+
             def fit_func(beta, x):
                 return beta[0] * x
 
@@ -132,33 +130,28 @@ def FullLogBruneModel(f,log_omega0,log_fc,t_star):
     return omega
 
 
-def FitBruneModel(f_dict,Pxx_dict,err_dict,arrivals,freqmin,freqmax):
+def FitBruneModel(f_dict,Pxx_dict,arrivals):
     results = {}
-    #TODO try using the log of the corner frequency to force it to stay positive without bounds
-    #TODO also is consistant with how we look at the spectra using log of omega0 and fc.
+ 
     for key in f_dict.keys():
         f = f_dict[key]
         Pxx = Pxx_dict[key]
-        sigma = err_dict[key]
 
         if np.isnan(Pxx).any():
             results[key] = None
         else:
             t_star_est = (arrivals['R'][key] / 3870) / 30
-            #x0 = [np.log(np.max(Pxx)),2,t_star_est]
             x0 = [np.log(np.max(Pxx)),np.log(2),t_star_est]
-            #bounds = (np.array([-np.inf,freqmin,0]),np.array([np.inf,freqmax,np.inf]))
-            #bounds = [[0,np.inf]] + [[freqmin,freqmax],[10,200]] * N
-            res = curve_fit(FullLogBruneModel,f,Pxx,p0=x0,full_output=True,nan_policy='omit')#,x_scale='jac')#,bounds=bounds)#,sigma=sigma)#,jac=BruneJacobian) #TODO turn bounds back on? Need to try using log(Omega) as input so same scale as other params...
+            res = curve_fit(FullLogBruneModel,f,Pxx,p0=x0,full_output=True,nan_policy='omit')#,x_scale='jac')#,bounds=bounds)#,sigma=sigma)#,jac=BruneJacobian) 
             results[key] = res
     return results
 
 def CurveFit(disp_stream,arrivals,freqmin=0,freqmax=np.inf):
     #first compute the P wave spectrum at each of the stations
-    f_dict, Pxx_dict, ci_dict, err_dict = SourceSpectrum(disp_stream,arrivals,freqmin=freqmin,freqmax=freqmax)
+    f_dict, Pxx_dict, _, _ = SourceSpectrum(disp_stream,arrivals,freqmin=freqmin,freqmax=freqmax)
 
     #now fit the spectra at each with the Brune model to get Omega0...
-    results = FitBruneModel(f_dict,Pxx_dict,err_dict,arrivals,freqmin,freqmax)
+    results = FitBruneModel(f_dict,Pxx_dict,arrivals)
     #unpack this list into the individual parameters
     rows = []
     labels = []
@@ -179,57 +172,20 @@ def CurveFit(disp_stream,arrivals,freqmin=0,freqmax=np.inf):
     return df
 
 
-# def MomentMagnitude(disp_stream,sta_xy,freqmin=0,freqmax=np.inf):
-#     output_df = CurveFit(disp_stream,sta_xy,freqmin=freqmin,freqmax=freqmax)
-#     theta_dict, theta_unc_dict = IncidenceAngle(disp_stream,sta_xy,freqmin=freqmin,freqmax=freqmax)
 
-#     rho = ufloat(912,10.0) #TODO find reasonable uncertainty from literature
-#     v = ufloat(3870,100.0) #TODO find reasonable uncertainty from literature
-#     A_rad = ufloat(0.44,0.2) #TODO think about best uncertainty estimate
-#     theta_unc = {}
-#     r_unc = {}
-#     logomega0_unc = {}
-#     M0_unc = {}
-#     for sta, row in sta_xy.iterrows():
-#         r_fit = row['r_fit']*1000
-#         r_unc = row['sR'] * 1000
-#         theta_unc[sta] = ufloat(theta_dict[sta],theta_unc_dict[sta])
-#         r_unc[sta] = ufloat(r_fit,r_unc)
-#         logomega0_unc[sta] = ufloat(output_df['logomega0'][sta],output_df['dlogomega0'][sta])
-
-#         M0_unc[sta] = 4*np.pi*rho*v**3*r_unc[sta]*exp(logomega0_unc[sta]) / (A_rad * 2*cos(theta_unc[sta]))
-
-#     M0_vals = []
-#     M0_sd = []
-#     for key in M0_unc.keys():
-#         M0_vals.append(M0_unc[key].nominal_value)
-#         M0_sd.append(M0_unc[key].std_dev)
-#     M0_vals = np.array(M0_vals)
-#     M0_sd = np.array(M0_sd)
-
-#     M0_ave = np.nansum(M0_vals/(M0_sd**2)) / np.nansum(1/M0_sd**2)
-#     M0_ave_sd = 1 / np.sqrt(np.nansum(1/M0_sd**2))
-
-#     M0 = ufloat(M0_ave,M0_ave_sd)
-#     Mw = 2/3 * log10(M0) - 6.0
-#     #? split into two functions - the second is just going from the output dataframe to the moment magnitude (IE the last couple of lines here with unc est from the mean values)
-#     #TODO return dataframe with full details rather than just the mean Mw, M0 - will be a row in the full dataframe output for all events...
-#     return Mw, M0
-
-
-def StationMomentMagnitude(disp_stream,arrivals,freqmin=0,freqmax=np.inf):
+def StationMomentMagnitude(disp_stream,arrivals,freqmin=0,freqmax=np.inf,rho=912.0,drho=10.0,v=3870.0,dv=100,A_rad=0.44,dA_rad=0.2):
     station_mags = CurveFit(disp_stream,arrivals,freqmin=freqmin,freqmax=freqmax)
     theta_dict, theta_unc_dict = IncidenceAngle(disp_stream,arrivals,freqmin=freqmin,freqmax=freqmax)
 
-    rho = ufloat(912,10.0) #TODO find reasonable uncertainty from literature
-    v = ufloat(3870,100.0) #TODO find reasonable uncertainty from literature
-    A_rad = ufloat(0.44,0.2) #TODO think about best uncertainty estimate
+    u_rho = ufloat(rho,drho) 
+    u_v = ufloat(v,dv) 
+    u_A_rad = ufloat(A_rad,dA_rad) 
 
     for sta, row in station_mags.iterrows():
         logomega0 = ufloat(row['logomega0'],row['dlogomega0'])
         r = ufloat(arrivals['R'][sta],arrivals['dR'][sta]) #! need to work out best way of feeding R uncertainty in - probably through arrivals dataframe...
         theta = ufloat(theta_dict[sta],theta_unc_dict[sta])
-        M0 = 4*np.pi*rho*v**3*r*exp(logomega0) / (A_rad * 2*cos(theta))
+        M0 = 4*np.pi*u_rho*u_v**3*r*exp(logomega0) / (u_A_rad * 2*cos(theta))
         Mw = 2/3 * log10(M0) - 6.0
 
         station_mags.at[sta,'M0'] = M0.nominal_value
@@ -244,31 +200,19 @@ def CombinedMomentMagnitude(station_mags):
     M0_vals = []
     M0_sd = []
 
-    #fc_vals = []
-    #fc_sd = []
     for sta, row in station_mags.iterrows():
         M0_vals.append(row['M0'])
         M0_sd.append(row['dM0'])
 
-        #fc_vals.append(row['fc'])
-        #fc_sd.append(row['dfc'])
-
     M0_vals = np.array(M0_vals)
     M0_sd = np.array(M0_sd)
-
-    #fc_vals = np.array(fc_vals)
-    #fc_sd = np.array(fc_sd)
 
     M0_ave = np.nansum(M0_vals/(M0_sd**2)) / np.nansum(1/M0_sd**2)
     M0_ave_sd = 1 / np.sqrt(np.nansum(1/M0_sd**2))
 
-    #fc_ave = np.nansum(fc_vals/(fc_sd**2)) / np.nansum(1/fc_sd**2)
-    #fc_ave_sd = 1 / np.sqrt(np.nansum(1/fc_sd**2))
-
-    #fc = ufloat(fc_ave,fc_ave_sd)
     M0 = ufloat(M0_ave,M0_ave_sd)
     Mw = 2/3 * log10(M0) - 6.0
 
-    return M0, Mw#, fc
+    return M0, Mw
 
 
