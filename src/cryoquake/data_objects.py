@@ -763,6 +763,10 @@ class EventCatalogue:
     def select_event(self,event_id):
         event_row = self.events.loc[event_id]
         trace_rows = self.traces.loc[event_id]
+
+        if type(trace_rows) == pd.Series:
+            trace_rows = trace_rows.to_frame().T
+            
         event_obj = SeismicEvent(event_row,trace_rows)   
         return event_obj
 
