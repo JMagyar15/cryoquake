@@ -386,7 +386,8 @@ def __make_catalogues(events, stream, events_list, stream_list, starttime, endti
                 if k == 0:
                     traces_df = trace_df
                 else:
-                    traces_df = traces_df.append(trace_df, ignore_index=True)
+                    #traces_df = traces_df.append(trace_df, ignore_index=True)
+                    traces_df = pd.concat([traces_df, trace_df], ignore_index=True)
                 k = k + 1
 
     else:
