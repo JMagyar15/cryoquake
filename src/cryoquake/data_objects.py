@@ -172,7 +172,7 @@ class SeismicEvent:
         """
         self.stream = self.stream.split()
         self.stream.detrend("demean")
-        self.stream.taper(None,max_length=self.extra/2,type='blackman')
+        self.stream.taper(None,max_length=self.extra/2,type='cosine')
         self.stream.filter(type,**options)
         self.stream.detrend("demean")
         self.stream = self.stream.merge(fill_value=None)
