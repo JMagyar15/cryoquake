@@ -53,6 +53,7 @@ class SeismicEvent:
         self.inv = None
 
         self.attributes = pd.DataFrame(columns=['Name','Value','Label'])
+        self.dec_factor = 1
         
     def context(self,new_context=None):
         """
@@ -187,6 +188,7 @@ class SeismicEvent:
         self.stream.remove_response(inventory=self.inv,**options)
 
     def decimate(self,factor):
+        self.dec_factor *= factor
         self.stream = self.stream.split()
         self.stream.decimate(factor)
         self.stream = self.stream.merge(fill_value=None)
@@ -209,7 +211,7 @@ class SeismicEvent:
                     if len(subset) > 0:
                         tr = subset[0].trim(self.data_window[0]-self.extra,self.data_window[1]+self.extra) #want to trim to the window length with padding to make sure all have same number of samples
                     elif len(subset) == 0:
-                        tr = Trace(data=create_empty_data_chunk(1,'f'),header={'network':network.code,'station':station.code,'location_code':channel.location_code,'channel':channel.code,'starttime':self.data_window[0]-self.extra,'sampling_rate':channel.sample_rate}).trim(self.data_window[0]-self.extra,self.data_window[1]+self.extra,pad=True,fill_value=None)
+                        tr = Trace(data=create_empty_data_chunk(1,'f'),header={'network':network.code,'station':station.code,'location_code':channel.location_code,'channel':channel.code,'starttime':self.data_window[0]-self.extra,'sampling_rate':int(channel.sample_rate/self.dec_factor)}).trim(self.data_window[0]-self.extra,self.data_window[1]+self.extra,pad=True,fill_value=None)
                     else:
                         raise(Exception('Non-uniqueness in trace IDs'))
                     
