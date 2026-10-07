@@ -192,7 +192,7 @@ MINIMAL VERSION OF CATALOGUE GENERATION (WITHOUT AMPLITUDE/ENERGY INFORMATION, D
 """
 
 
-def get_events(stream, starttime, endtime, inv, signal_type='amplitude', station_name='stations', trigger_type='recstalta', avg_wave_speed=2, thr_event_join=0.5, thr_coincidence_sum=-1, thr_on=5, thr_off=1, **options): # avg_wave_speed in km/s
+def get_events(stream, starttime, endtime, inv, signal_type='amplitude', station_name='stations', trigger_type='recstalta', avg_wave_speed=2, thr_event_join=0.5, thr_coincidence_sum=-1, thr_on=5, thr_off=1,min_duration=0.0, **options): # avg_wave_speed in km/s
     """
     Function to detect events from seismic waveform data using STA/LTA-type algorithms. The input waveforms are denoted by seismometer and channel (e.g. ‘BH?’, ‘HH?’, ‘LH?’); the signal from seismometers with multiple components (i.e. ‘Z’, ‘N’, ‘E’) are combined into a single waveform using the Euclidean norm. The triggering algorithm is applied to the resulting amplitude or energy waveform. Small gaps between triggered events are removed before the combined event details are written to the (reference) event catalogue. If multiple seismometers are present the user can specify the minimum number of seismometers on which an event must be detected for that event to be included in the catalogue.
     
@@ -220,6 +220,8 @@ def get_events(stream, starttime, endtime, inv, signal_type='amplitude', station
         Threshold for switching single seismometer trigger on. The default value is a threshold of 5.
     thr_off : float, optional
         Threshold for switching single seismometer trigger off. The default value is a threshold of 1.
+    min_duration : float, optional
+        The minimum duration of events to be included in the event catalogue. The default value is 0.0 seconds.
     options
         Necessary keyword arguments for the respective trigger algorithm that will be passed on. For example ‘sta’ and ‘lta’ for any STA/LTA variant (e.g. sta=3, lta=10). Arguments ‘sta’ and ‘lta’ (seconds) will be mapped to ‘nsta’ and ‘nlta’ (samples) by multiplying by the sampling rate of trace (e.g. sta=3, lta=10 would call the trigger algorithm with 3 and 10 seconds average, respectively).
         
@@ -254,7 +256,7 @@ def get_events(stream, starttime, endtime, inv, signal_type='amplitude', station
 
     # trigger events using specified event detection algorithm
     events, coincident_events = __coincidence_trigger(trigger_type=trigger_type, thr_on=thr_on, thr_off=thr_off, stream=new_stream, nseismometers=len(stream_list), thr_travel_time=distance/avg_wave_speed, thr_event_join=thr_event_join, thr_coincidence_sum=thr_coincidence_sum, **options)
-    events_df, traces_df = __make_catalogues(coincident_events, stream, events, stream_list, starttime, endtime, signal_type, thr_travel_time=distance/avg_wave_speed, thr_coincidence_sum=thr_coincidence_sum)
+    events_df, traces_df = __make_catalogues(coincident_events, stream, events, stream_list, starttime, endtime, signal_type, thr_travel_time=distance/avg_wave_speed, thr_coincidence_sum=thr_coincidence_sum, min_duration=min_duration)
 
     return events_df, traces_df
 
@@ -328,7 +330,7 @@ def __get_distances(stream, starttime, inv, thr_coincidence_sum=1):
             # too computationally inefficient, so use maximum distance in array
             return np.max(distances_list)
 
-def __make_catalogues(events, stream, events_list, stream_list, starttime, endtime, signal_type='amplitude', thr_travel_time=0, thr_coincidence_sum=1):
+def __make_catalogues(events, stream, events_list, stream_list, starttime, endtime, signal_type='amplitude', thr_travel_time=0, thr_coincidence_sum=1,min_duration=0.0):
     """
     Private function for get_events() to create reference and trace catalogues of the identified events.
     """
@@ -346,6 +348,7 @@ def __make_catalogues(events, stream, events_list, stream_list, starttime, endti
     # remove events outside requested time window and less than 10 times the sampling rate
     df = df[np.logical_and(df['time'] + df['duration'] > starttime, df['time'] < endtime)]
     df = df[df['duration'] > 10./stream[0].stats.sampling_rate]
+    df = df[df['duration'] > min_duration]
     df.reset_index(drop=True, inplace=True)
     
     #TODO can probably avoid the for loop here and vectorise this? Not sure whether this is the bottleneck or the trigger sorting as computing the characteristic function is pretty quick...
