@@ -897,6 +897,8 @@ def BedScan(inv,p_picks,bed_grid,V=3900,sigma_V=100,Delta=10000,bed_error=True,n
                                             ((rho_DV * sigma_D_j * sigma_V) / (D_i * V))**2 + 
                                             ((rho_V * sigma_V**2)/(V**2))**2)**(0.5)
 
+            # C_T[:, :, i_s, j_s] = (rho_D * sigma_D_i * sigma_D_j / V**2
+            #                         + D_i * D_j * sigma_V**2 / V**4)
     
 
     if no_model_error:
@@ -904,45 +906,100 @@ def BedScan(inv,p_picks,bed_grid,V=3900,sigma_V=100,Delta=10000,bed_error=True,n
     else:
         C = C_t + C_T
 
-    P = np.linalg.inv(C) # N x M x S x S
 
-    p = np.sum(P,axis=2)
-    K = np.sum(P,axis=(2,3))
+    
+    # Assemble predicted travel times in station order
+    h_arr = np.stack(
+        [h[sta_code].to_numpy() for sta_code in pick_sta],
+        axis=-1
+    )  # (Nx, Ny, N)
 
-    t_ave = np.zeros((xlin.size,ylin.size,N))
-    h_ave = np.zeros((xlin.size,ylin.size,N))
+    ones = np.ones(N)
 
-    for j, sta_code in enumerate(pick_sta):
-        t_ave[:,:,j] = (p[:,:,j] * mu_P[j]) / K
+    # C^{-1} @ 1
+    z = np.linalg.solve(
+        C,
+        np.broadcast_to(ones, C.shape[:-1])[..., None]
+    )[..., 0]
 
-        h_ave[:,:,j] = (p[:,:,j] * h.variables[sta_code].to_numpy()) / K
+    K = np.sum(z, axis=-1)
+
+    # C^{-1} @ mu_P
+    q = np.linalg.solve(
+        C,
+        np.broadcast_to(mu_P, C.shape[:-1])[..., None]
+    )[..., 0]
+
+    t_ave = np.sum(q, axis=-1) / K
+
+    # C^{-1} @ h
+    r_h = np.linalg.solve(C, h_arr[..., None])[..., 0]
+
+    h_ave = np.sum(r_h, axis=-1) / K
+
+    # Residual after profiling out origin time
+    t0_grid = t_ave - h_ave
+    resid = (mu_P - h_arr) - t0_grid[..., None]
+
+    # Generalised least-squares misfit
+    r = np.linalg.solve(C, resid[..., None])[..., 0]
+    misfit = np.sum(resid * r, axis=-1)
+
+    #P = np.linalg.inv(C) # N x M x S x S
+
+    #p = np.sum(P,axis=2)
+    #K = np.sum(P,axis=(2,3))
+
+    #t_ave = np.zeros((xlin.size,ylin.size,N))
+    #h_ave = np.zeros((xlin.size,ylin.size,N))
+
+    # t_tilde = np.zeros((xlin.size, ylin.size, N))
+    # h_tilde = np.zeros((xlin.size, ylin.size, N))
+
+    # for i, sta_code in enumerate(pick_sta):
+    #     t_tilde[:, :, i] = mu_P[i] - t_ave
+    #     h_tilde[:, :, i] = h.variables[sta_code].to_numpy() - h_ave
+
+    # resid = t_tilde - h_tilde
+
+    # for j, sta_code in enumerate(pick_sta):
+    #     t_ave[:,:,j] = (p[:,:,j] * mu_P[j]) / K
+
+    #     h_ave[:,:,j] = (p[:,:,j] * h.variables[sta_code].to_numpy()) / K
         
-    t_ave = t_ave.sum(axis=2)
-    h_ave = h_ave.sum(axis=2)
+    # t_ave = t_ave.sum(axis=2)
+    # h_ave = h_ave.sum(axis=2)
 
-    t_tilde = np.zeros((xlin.size,ylin.size,N))
-    h_tilde = np.zeros((xlin.size,ylin.size,N))
 
-    for i, sta_code in enumerate(pick_sta):
-        t_tilde[:,:,i] = mu_P[i] - t_ave
-        h_tilde[:,:,i] = h.variables[sta_code].to_numpy() - h_ave
+    # t_tilde = np.zeros((xlin.size,ylin.size,N))
+    # h_tilde = np.zeros((xlin.size,ylin.size,N))
 
-    resid = t_tilde - h_tilde
-    res = np.squeeze(P @ resid[:,:,:,None]) # N x M x S
-    misfit = np.squeeze(resid[:,:,None,:] @ res[:,:,:,None]) #resid is N x M x S
+    # for i, sta_code in enumerate(pick_sta):
+    #     t_tilde[:,:,i] = mu_P[i] - t_ave
+    #     h_tilde[:,:,i] = h.variables[sta_code].to_numpy() - h_ave
+
+    # resid = t_tilde - h_tilde
+    # res = np.squeeze(P @ resid[:,:,:,None]) # N x M x S
+    # misfit = np.squeeze(resid[:,:,None,:] @ res[:,:,:,None]) #resid is N x M x S
     gamma_arr = (N-2) * (misfit - misfit.min()) / misfit.min() #compute the contour function from the misfit.
 
-    #convert gamma to a xarray dataarray...
+    # #convert gamma to a xarray dataarray...
 
     gamma = gamma.assign({'gamma':(('x','y'),gamma_arr), 'chi2':(('x','y'),misfit)})
 
-    #work out t0 for the optimal solution and attach this to the dataset
+    # #work out t0 for the optimal solution and attach this to the dataset
 
-    x_ind, y_ind = np.unravel_index(np.argmin(gamma_arr),gamma_arr.shape)
-    x0 = xlin[x_ind]
-    y0 = ylin[y_ind]    
+    # x_ind, y_ind = np.unravel_index(np.argmin(gamma_arr),gamma_arr.shape)
+    # x0 = xlin[x_ind]
+    # y0 = ylin[y_ind]    
     
-    fit = h_tilde[x_ind,y_ind,:] + t_ave[x_ind,y_ind]
+    # fit = h_tilde[x_ind,y_ind,:] + t_ave[x_ind,y_ind]
+
+    x_ind, y_ind = np.unravel_index(np.argmin(misfit), misfit.shape)
+
+    x0 = xlin[x_ind]
+    y0 = ylin[y_ind]
+    t0 = t0_grid[x_ind, y_ind]
 
     h_fit = np.zeros(N)
 
@@ -975,7 +1032,7 @@ def BedScan(inv,p_picks,bed_grid,V=3900,sigma_V=100,Delta=10000,bed_error=True,n
         gamma.attrs['dD_'+sta_code] = sigma
 
 
-    t0 = np.mean(fit - h_fit) #all these values are actually the same (as they should be)
+    #t0 = np.mean(fit - h_fit) #all these values are actually the same (as they should be)
 
     gamma.attrs['t0'] = t0
     gamma.attrs['x0'] = x0
@@ -1000,4 +1057,4 @@ def BedScan(inv,p_picks,bed_grid,V=3900,sigma_V=100,Delta=10000,bed_error=True,n
 
     gamma = gamma.assign({'pdf':(('x','y'),pdf)})
 
-    return gamma
+    return gamma, C[x_ind,y_ind,:,:]

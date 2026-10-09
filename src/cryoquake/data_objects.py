@@ -694,8 +694,11 @@ class EventCatalogue:
 
         self.i = 0 #set the current index to zero
 
-        self.event_times = np.array([UTCDateTime(time) for time in event_cat['ref_time'].to_numpy()],dtype=UTCDateTime) #array of the event reference times.
+        if event_cat is not None:
 
+            self.event_times = np.array([UTCDateTime(time) for time in event_cat['ref_time'].to_numpy()],dtype=UTCDateTime) #array of the event reference times.
+        else:
+            self.event_times = np.array([])
 
     def __len__(self):
         return self.N
