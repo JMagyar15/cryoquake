@@ -842,7 +842,7 @@ def BedScan(inv,p_picks,bed_grid,V=3900,sigma_V=100,Delta=10000,bed_error=True,n
 
     h = d / V
 
-    if ~bed_error:
+    if not bed_error:
         sigma_D = 0.0 * sigma_D
 
     sta_xy, D, sta_lst = EPSGStations(inv)
@@ -892,13 +892,13 @@ def BedScan(inv,p_picks,bed_grid,V=3900,sigma_V=100,Delta=10000,bed_error=True,n
             else:
                 rho_DV = 0.0
             
-            C_T[:,:,i_s,j_s] = h_i * h_j * (((rho_D * sigma_D_i * sigma_D_j) / (D_i * D_j))**2 + 
-                                            ((rho_DV * sigma_D_i * sigma_V) / (D_j * V))**2 +
-                                            ((rho_DV * sigma_D_j * sigma_V) / (D_i * V))**2 + 
-                                            ((rho_V * sigma_V**2)/(V**2))**2)**(0.5)
+            # C_T[:,:,i_s,j_s] = h_i * h_j * (((rho_D * sigma_D_i * sigma_D_j) / (D_i * D_j))**2 + 
+            #                                 ((rho_DV * sigma_D_i * sigma_V) / (D_j * V))**2 +
+            #                                 ((rho_DV * sigma_D_j * sigma_V) / (D_i * V))**2 + 
+            #                                 ((rho_V * sigma_V**2)/(V**2))**2)**(0.5)
 
-            # C_T[:, :, i_s, j_s] = (rho_D * sigma_D_i * sigma_D_j / V**2
-            #                         + D_i * D_j * sigma_V**2 / V**4)
+            C_T[:, :, i_s, j_s] = (rho_D * sigma_D_i * sigma_D_j / V**2
+                                    + rho_V * D_i * D_j * sigma_V**2 / V**4)
     
 
     if no_model_error:
@@ -943,7 +943,16 @@ def BedScan(inv,p_picks,bed_grid,V=3900,sigma_V=100,Delta=10000,bed_error=True,n
 
     # Generalised least-squares misfit
     r = np.linalg.solve(C, resid[..., None])[..., 0]
-    misfit = np.sum(resid * r, axis=-1)
+    #misfit = np.sum(resid * r, axis=-1)
+
+    misfit = np.sum(resid * r, axis=-1)           # r^T C^-1 r, keep this
+
+    sign, logdet = np.linalg.slogdet(C)           # C is (Nx, Ny, N, N), so this is batched -> (Nx, Ny)
+    nll = misfit + logdet + np.log(K)  
+    
+    logK = np.log(K)
+
+          # -2 ln L, with t0 marginalised under a flat prior
 
     #P = np.linalg.inv(C) # N x M x S x S
 
@@ -981,12 +990,12 @@ def BedScan(inv,p_picks,bed_grid,V=3900,sigma_V=100,Delta=10000,bed_error=True,n
     # resid = t_tilde - h_tilde
     # res = np.squeeze(P @ resid[:,:,:,None]) # N x M x S
     # misfit = np.squeeze(resid[:,:,None,:] @ res[:,:,:,None]) #resid is N x M x S
-    gamma_arr = (N-2) * (misfit - misfit.min()) / misfit.min() #compute the contour function from the misfit.
-
+    #gamma_arr = (N-2) * (misfit - misfit.min()) / misfit.min() #compute the contour function from the misfit.
+    gamma_arr = nll - nll.min()    # ~ chi^2 with 2 dof in the neighbourhood of the optimum (x, y free)
     # #convert gamma to a xarray dataarray...
 
-    gamma = gamma.assign({'gamma':(('x','y'),gamma_arr), 'chi2':(('x','y'),misfit)})
-
+    #gamma = gamma.assign({'gamma':(('x','y'),gamma_arr), 'chi2':(('x','y'),misfit)})
+    gamma = gamma.assign({'gamma':(('x','y'),gamma_arr), 'chi2':(('x','y'),nll)})
     # #work out t0 for the optimal solution and attach this to the dataset
 
     # x_ind, y_ind = np.unravel_index(np.argmin(gamma_arr),gamma_arr.shape)
@@ -995,7 +1004,9 @@ def BedScan(inv,p_picks,bed_grid,V=3900,sigma_V=100,Delta=10000,bed_error=True,n
     
     # fit = h_tilde[x_ind,y_ind,:] + t_ave[x_ind,y_ind]
 
-    x_ind, y_ind = np.unravel_index(np.argmin(misfit), misfit.shape)
+    #x_ind, y_ind = np.unravel_index(np.argmin(misfit), misfit.shape)
+    x_ind, y_ind = np.unravel_index(np.argmin(nll), nll.shape)
+ 
 
     x0 = xlin[x_ind]
     y0 = ylin[y_ind]
@@ -1003,10 +1014,12 @@ def BedScan(inv,p_picks,bed_grid,V=3900,sigma_V=100,Delta=10000,bed_error=True,n
 
     h_fit = np.zeros(N)
 
-
-    chi2_norm = (misfit / misfit.min()) * (N-2) 
-    pdf = chi2.pdf(chi2_norm,N-2) #get the unnormalised pdf structure
+    pdf = np.exp(-0.5 * (nll - nll.min()))
     pdf /= pdf.sum()
+
+    #chi2_norm = (misfit / misfit.min()) * (N-2) 
+    #pdf = chi2.pdf(chi2_norm,N-2) #get the unnormalised pdf structure
+    #pdf /= pdf.sum()
     pdf_flat = pdf.flatten()
 
 
@@ -1058,3 +1071,199 @@ def BedScan(inv,p_picks,bed_grid,V=3900,sigma_V=100,Delta=10000,bed_error=True,n
     gamma = gamma.assign({'pdf':(('x','y'),pdf)})
 
     return gamma, C[x_ind,y_ind,:,:]
+
+
+
+# NOTE: DistXr and EPSGStations are assumed to be defined elsewhere in your module.
+
+
+# ----------------------------------------------------------------------
+# Helper functions
+# ----------------------------------------------------------------------
+
+def outer(a):
+    """Outer product over the last axis: out[..., i, j] = a[..., i] * a[..., j]."""
+    return a[..., :, None] * a[..., None, :]
+
+
+def quad_form(r, A):
+    """Batched quadratic form  r^T A r  for r of shape (..., N) and A of shape (..., N, N)."""
+    return (r[..., None, :] @ A @ r[..., :, None])[..., 0, 0]
+
+
+def stack_stations(ds, stations):
+    """
+    Turn an xarray Dataset (one variable per station) into one numpy array of
+    shape (Nx, Ny, N). Dims are forced to (x, y) so the grid orientation can
+    never get mixed up between the different arrays.
+    """
+    return np.stack([ds[s].transpose('x', 'y').to_numpy() for s in stations], axis=-1)
+
+
+def travel_time_covariance(h, d_path, sigma_D, D_sta, sigma_V, V, Delta):
+    """
+    Model (distance and velocity) covariance of the predicted travel times.
+
+    With T_i = D_i / V and independent errors in D and V, first-order error
+    propagation gives  dT_i = h_i * (dD_i / D_i - dV / V),  so
+
+        C_T[i, j] = h_i h_j * ( rho_D * (sD_i / D_i) * (sD_j / D_j)
+                                + rho_V[i, j] * (sV / V)^2 )
+
+    h       : predicted travel times, (Nx, Ny, N)
+    d_path  : path lengths D_i,       (Nx, Ny, N)
+    sigma_D : path length error,      (Nx, Ny, N)
+    D_sta   : station-station distances, (N, N)
+    returns : (Nx, Ny, N, N)
+    """
+    rho_D = 1.0                                    # bed error fully correlated between stations
+    rho_V = np.exp(-0.5 * D_sta**2 / Delta**2)     # velocity error correlated over length scale Delta
+
+    rel_D_error = sigma_D / d_path                 # sD_i / D_i
+    rel_V_error = sigma_V / V                      # sV / V
+
+    return outer(h) * (rho_D * outer(rel_D_error) + rho_V * rel_V_error**2)
+
+
+def profile_origin_time(mu_P, h, C_inv):
+    """
+    Generalised least squares estimate of the origin time t0 at every grid cell.
+
+    Minimising  (mu_P - h - t0*1)^T C^-1 (mu_P - h - t0*1)  over t0 gives
+
+        t0 = 1^T C^-1 (mu_P - h) / (1^T C^-1 1)
+
+    returns t0 of shape (Nx, Ny)
+    """
+    ones = np.ones(h.shape[-1])
+    w = C_inv @ ones                       # C^-1 1, shape (Nx, Ny, N)
+    K = w.sum(axis=-1)                     # 1^T C^-1 1
+    return (w * (mu_P - h)).sum(axis=-1) / K
+
+
+def credible_sigma(values, weights):
+    """
+    Standard deviation equivalent of the central 95% credible interval
+    (a Gaussian's 95% interval is 4 sigma wide) of a weighted 1-D distribution.
+    """
+    order = np.argsort(values)
+    values, weights = values[order], weights[order]
+
+    cdf = np.cumsum(weights)
+    cdf /= cdf[-1]
+
+    inside = values[(cdf >= 0.025) & (cdf <= 0.975)]
+
+    # A single grid cell holding >95% of the probability leaves nothing inside the
+    # interval: the uncertainty is then smaller than the grid spacing, so report NaN.
+    if inside.size == 0:
+        return np.nan
+
+    return (inside[-1] - inside[0]) / 4
+
+
+# ----------------------------------------------------------------------
+# Main function
+# ----------------------------------------------------------------------
+def BedScanUpdate(inv, p_picks, bed_grid, V=3900, sigma_V=100, Delta=10000,
+            bed_error=True, no_model_error=False, sigma_floor=0.0):
+    """
+    Grid search for the location and origin time of a seismic source at the glacier bed.
+ 
+    inv       : obspy inventory with the stations
+    p_picks   : pandas dataframe with columns 'mu' and 'sigma' (index = station code),
+                the mean and standard deviation of the P arrival time. NaN mu = no pick.
+    bed_grid  : xarray with the x and y coordinates of the search grid, and the bed
+                topography and its uncertainty
+    V         : P wave speed (m/s)
+    sigma_V   : uncertainty on V (m/s)
+    Delta     : correlation length of the velocity error between stations (m)
+    bed_error : include the bed topography uncertainty in the model covariance
+    no_model_error : use only the picking errors in the covariance
+    sigma_floor : minimum timing error (s) added in quadrature to every station's
+                picking error, so very precise picks (e.g. at nearby stations) cannot
+                dominate the fit beyond what the simple homogeneous-velocity model
+                can support. 0 = no floor.
+ 
+    returns   : gamma (xarray Dataset with misfit, contour function, pdf and best-fit
+                attributes), and the covariance matrix at the best-fit cell
+    """
+ 
+    xlin = bed_grid.x.to_numpy()
+    ylin = bed_grid.y.to_numpy()
+ 
+    # ---- 1. Geometry: path lengths and their uncertainty for every station --------
+    d, sigma_D = DistXr(inv, bed_grid)
+    sta_xy, D_sta, sta_lst = EPSGStations(inv)
+ 
+    # ---- 2. Keep only the stations that have a pick -------------------------------
+    mu_all = np.array([p_picks['mu'][s] for s in sta_lst], dtype=float)
+    sigma_all = np.array([p_picks['sigma'][s] for s in sta_lst], dtype=float)
+    has_pick = ~np.isnan(mu_all)
+ 
+    mu_P = mu_all[has_pick]                         # observed arrival times, (N,)
+    sigma_P = sigma_all[has_pick]                   # picking uncertainties, (N,)
+    D_sta = D_sta[np.ix_(has_pick, has_pick)]       # station-station distances, (N, N)
+    pick_sta = [s for s, ok in zip(sta_lst, has_pick) if ok]
+    N = len(pick_sta)
+ 
+    # ---- 3. Predicted travel times  h = D / V  (Nx, Ny, N) ------------------------
+    d_path = stack_stations(d, pick_sta)
+    sigma_D_path = stack_stations(sigma_D, pick_sta)
+    if not bed_error:
+        sigma_D_path = np.zeros_like(sigma_D_path)
+ 
+    h = d_path / V
+ 
+    # ---- 4. Covariance  C = C_t + C_T  (Nx, Ny, N, N) -----------------------------
+    # picking error plus the floor: independent between stations, so diagonal.
+    # sigma_eff^2 = sigma_P^2 + sigma_floor^2
+    C_t = np.diag(sigma_P**2 + sigma_floor**2)
+    C_T = travel_time_covariance(h, d_path, sigma_D_path, D_sta, sigma_V, V, Delta)
+ 
+    C = C_t if no_model_error else C_t + C_T
+    C = np.broadcast_to(C, h.shape + (N,))          # make sure it is (Nx, Ny, N, N)
+ 
+    C_inv = np.linalg.inv(C)
+ 
+    # ---- 5. Misfit, with the origin time t0 profiled out --------------------------
+    #   resid = mu_P - h - t0,    misfit = resid^T C^-1 resid
+    t0_grid = profile_origin_time(mu_P, h, C_inv)
+    resid = mu_P - h - t0_grid[..., None]
+    misfit = quad_form(resid, C_inv)
+ 
+    # contour function: gamma = (N - 2) * (misfit - misfit_min) / misfit_min
+    misfit_min = misfit.min()
+    gamma_arr = (N - 2) * (misfit - misfit_min) / misfit_min
+ 
+    # ---- 6. Best-fit cell -----------------------------------------------------------
+    x_ind, y_ind = np.unravel_index(np.argmin(misfit), misfit.shape)
+    x0, y0, t0 = xlin[x_ind], ylin[y_ind], t0_grid[x_ind, y_ind]
+ 
+    # ---- 7. Probability density over the grid -------------------------------------
+    chi2_norm = (N - 2) * misfit / misfit_min
+    pdf = chi2.pdf(chi2_norm, N - 2)                # unnormalised
+    pdf /= pdf.sum()
+ 
+    # ---- 8. Output dataset ----------------------------------------------------------
+    gamma = xr.Dataset(coords=dict(x=xlin, y=ylin))
+    gamma = gamma.assign({'gamma': (('x', 'y'), gamma_arr),
+                          'chi2': (('x', 'y'), misfit),
+                          'pdf': (('x', 'y'), pdf)})
+ 
+    # best-fit path lengths and travel times, and the 1-sigma uncertainty on each
+    # path length from the posterior over the grid
+    for i, sta_code in enumerate(pick_sta):
+        gamma.attrs['D_' + sta_code] = d_path[x_ind, y_ind, i]
+        gamma.attrs['t_' + sta_code] = h[x_ind, y_ind, i]
+        gamma.attrs['dD_' + sta_code] = credible_sigma(d_path[..., i].ravel(), pdf.ravel())
+ 
+    # best-fit location and its marginal uncertainties
+    gamma.attrs['t0'] = t0
+    gamma.attrs['x0'] = x0
+    gamma.attrs['y0'] = y0
+    gamma.attrs['dx'] = credible_sigma(xlin, pdf.sum(axis=1))   # marginalise over y
+    gamma.attrs['dy'] = credible_sigma(ylin, pdf.sum(axis=0))   # marginalise over x
+    gamma.attrs['stations'] = pick_sta
+ 
+    return gamma, C[x_ind, y_ind, :, :]
