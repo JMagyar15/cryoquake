@@ -1074,92 +1074,246 @@ def BedScan(inv,p_picks,bed_grid,V=3900,sigma_V=100,Delta=10000,bed_error=True,n
 
 
 
-# NOTE: DistXr and EPSGStations are assumed to be defined elsewhere in your module.
+class BedScanner:
+    def __init__(self,inv,bed_grid):
+        #firstly check that the coordinate order is correct.
+        bed_grid = bed_grid.transpose("x","y")
+
+        #set up the geometry using the inventory and bed_grid
+        self.xlin = bed_grid.x.to_numpy()
+        self.ylin = bed_grid.y.to_numpy()
+         
+        self.D, self.sigma_D = self.DistXr(inv, bed_grid)
+        self.sta_xy, self.D_sta, self.sta_lst = self.EPSGStations(inv)
+
+        self.D_arr = self.__stack_stations(self.D)
+        self.sigma_D_arr = self.__stack_stations(self.sigma_D)
 
 
-# ----------------------------------------------------------------------
-# Helper functions
-# ----------------------------------------------------------------------
 
-def outer(a):
-    """Outer product over the last axis: out[..., i, j] = a[..., i] * a[..., j]."""
-    return a[..., :, None] * a[..., None, :]
+    def assign_parameters(self,V,sigma_V,Delta):
+        #can compute the covariance matrix here without the picking and floor, as the rest is geometry dependent
+        self.V = V
+        self.sigma_V = sigma_V
+        self.Delta = Delta
+        
+        self.h = self.D_arr / V
 
-
-def quad_form(r, A):
-    """Batched quadratic form  r^T A r  for r of shape (..., N) and A of shape (..., N, N)."""
-    return (r[..., None, :] @ A @ r[..., :, None])[..., 0, 0]
+        self.C_T = self.__travel_time_covariance()
 
 
-def stack_stations(ds, stations):
-    """
-    Turn an xarray Dataset (one variable per station) into one numpy array of
-    shape (Nx, Ny, N). Dims are forced to (x, y) so the grid orientation can
-    never get mixed up between the different arrays.
-    """
-    return np.stack([ds[s].transpose('x', 'y').to_numpy() for s in stations], axis=-1)
+    def fit(self,p_picks,model_error=True,sigma_floor=0.0):
+
+        #get the arrival information for the particular event.
+        mu_all = np.array([p_picks['mu'][s] for s in self.sta_lst], dtype=float)
+        sigma_all = np.array([p_picks['sigma'][s] for s in self.sta_lst], dtype=float)
+        has_pick = ~np.isnan(mu_all)
+
+        #pull out the particular stations with arrival information.
+        mu_P = mu_all[has_pick]                         # observed arrival times, (N,)
+        sigma_P = sigma_all[has_pick]                   # picking uncertainties, (N,)
+        pick_sta = [s for s, ok in zip(self.sta_lst, has_pick) if ok]
+        N = len(pick_sta) #number of stations with a pick
+
+        #only want the stations with picks for inversion
+        h = self.h[...,has_pick]
+        D_arr = self.D_arr[...,has_pick]
+        C_T = self.C_T[...,*np.ix_(has_pick,has_pick)] 
+
+        #diagonal terms given by picking and floor errors.
+        C_t = np.diag(sigma_P**2 + sigma_floor**2)
+
+        C = C_t + C_T if model_error else C_t #set the covariance matrix to the sum of the parts.
+        C_inv = np.linalg.inv(C)
+
+        #   r = mu_P - h - t0,    misfit = r^T C^-1 r
+        t0_grid = self.__profile_origin_time(mu_P, h, C_inv)
+        resid = mu_P - h - t0_grid[..., None]
+        misfit = self.__quad_form(resid, C_inv)
+        
+        # contour function: gamma = (N - 2) * (misfit - misfit_min) / misfit_min
+        misfit_min = misfit.min()
+        gamma_arr = (N - 2) * (misfit - misfit_min) / misfit_min
+
+        #now minimise the misfit to get the best fitting solution
+        x_ind, y_ind = np.unravel_index(np.argmin(misfit), misfit.shape)
+        x0, y0, t0 = self.xlin[x_ind], self.ylin[y_ind], t0_grid[x_ind, y_ind]
+
+        #uncertainties based on chi2 distribution
+        chi2_norm = (N - 2) * misfit / misfit_min
+        pdf = chi2.pdf(chi2_norm, N - 2)              
+        pdf /= pdf.sum()
+        
+        gamma = xr.Dataset(coords=dict(x=self.xlin, y=self.ylin))
+        gamma = gamma.assign({'gamma': (('x', 'y'), gamma_arr),
+                                'chi2': (('x', 'y'), misfit),
+                                'pdf': (('x', 'y'), pdf)})
+        
+
+        for i, sta_code in enumerate(pick_sta):
+            gamma.attrs['D_' + sta_code] = D_arr[x_ind, y_ind, i]
+            gamma.attrs['t_' + sta_code] = h[x_ind, y_ind, i]
+            gamma.attrs['dD_' + sta_code] = self.__credible_sigma(D_arr[..., i].ravel(), pdf.ravel())
+        
+        gamma.attrs['t0'] = t0
+        gamma.attrs['x0'] = x0
+        gamma.attrs['y0'] = y0
+        gamma.attrs['dx'] = self.__credible_sigma(self.xlin, pdf.sum(axis=1))   
+        gamma.attrs['dy'] = self.__credible_sigma(self.ylin, pdf.sum(axis=0)) 
+        gamma.attrs['stations'] = pick_sta
+        
+        return gamma
+
+        
 
 
-def travel_time_covariance(h, d_path, sigma_D, D_sta, sigma_V, V, Delta):
-    """
-    Model (distance and velocity) covariance of the predicted travel times.
+    def EPSGStations(self,inv):
+        """
+        Finds the positions of the stations in polar stereographic coordinates.
+        """
+        N = len(inv) #! this relies on the particular structure of the inventory - change this to be more general...
+        locations_ll = np.zeros((N,3))
 
-    With T_i = D_i / V and independent errors in D and V, first-order error
-    propagation gives  dT_i = h_i * (dD_i / D_i - dV / V),  so
+        i = 0
+        sta_lst = []
+        for net in inv:
+            for sta in net:
+                locations_ll[i,:] = np.array([sta.latitude,sta.longitude,sta.elevation])
+                sta_lst.append(sta.code)
+                i += 1
 
-        C_T[i, j] = h_i h_j * ( rho_D * (sD_i / D_i) * (sD_j / D_j)
-                                + rho_V[i, j] * (sV / V)^2 )
+        proj_wgs84 = pyproj.Proj(init="epsg:4326")
+        proj_epsg3031 = pyproj.Proj(init="epsg:3031")
+        x, y = pyproj.transform(proj_wgs84, proj_epsg3031, locations_ll[:,1], locations_ll[:,0])
 
-    h       : predicted travel times, (Nx, Ny, N)
-    d_path  : path lengths D_i,       (Nx, Ny, N)
-    sigma_D : path length error,      (Nx, Ny, N)
-    D_sta   : station-station distances, (N, N)
-    returns : (Nx, Ny, N, N)
-    """
-    rho_D = 1.0                                    # bed error fully correlated between stations
-    rho_V = np.exp(-0.5 * D_sta**2 / Delta**2)     # velocity error correlated over length scale Delta
+        sta_xy = np.zeros_like(locations_ll)
 
-    rel_D_error = sigma_D / d_path                 # sD_i / D_i
-    rel_V_error = sigma_V / V                      # sV / V
+        sta_xy[:,0] = x
+        sta_xy[:,1] = y
+        sta_xy[:,2] = locations_ll[:,2]
 
-    return outer(h) * (rho_D * outer(rel_D_error) + rho_V * rel_V_error**2)
+        #now make a pairwise distance matrix for the network...
+        D = np.zeros((N,N))
+        for i in range(N):
+            for j in range(N):
+                D[i,j] = np.sqrt(np.sum((sta_xy[i,:] - sta_xy[j,:])**2))
+
+        return sta_xy, D, sta_lst
+    
+    
+    def DistXr(self,inv,bed_grid):
+
+        xlin = bed_grid.x.to_numpy()
+        ylin = bed_grid.y.to_numpy()
+        d = xr.Dataset(coords=dict(x=xlin,y=ylin))
+        dz = xr.Dataset(coords=dict(x=xlin,y=ylin))
+
+        proj_wgs84 = pyproj.Proj(init="epsg:4326")
+        proj_epsg3031 = pyproj.Proj(init="epsg:3031")
+
+        for network in inv:
+            for station in network:
+                lat, lon, sta_z, = station.latitude,station.longitude,station.elevation
+                sta_x, sta_y = pyproj.transform(proj_wgs84, proj_epsg3031, lon, lat)
+
+                dX = d.x - sta_x
+                dY = d.y - sta_y
+                dZ = bed_grid.bed_topography - sta_z
+
+                dz = dz.assign({station.code:np.abs(dZ)}) #difference in elevation between station and bed
+                        
+                dist = (dX**2 + dY**2 + dZ**2)**(0.5)
+
+                d = d.assign({station.code:dist})
+        
+        sigma_D = bed_grid.bed_uncertainty * (dz / d)
+        return d, sigma_D
 
 
-def profile_origin_time(mu_P, h, C_inv):
-    """
-    Generalised least squares estimate of the origin time t0 at every grid cell.
+    def __travel_time_covariance(self):
+        """
+        Model (distance and velocity) covariance of the predicted travel times.
 
-    Minimising  (mu_P - h - t0*1)^T C^-1 (mu_P - h - t0*1)  over t0 gives
+        With T_i = D_i / V and independent errors in D and V, first-order error
+        propagation gives  dT_i = h_i * (dD_i / D_i - dV / V),  so
 
-        t0 = 1^T C^-1 (mu_P - h) / (1^T C^-1 1)
+            C_T[i, j] = h_i h_j * ( rho_D * (sD_i / D_i) * (sD_j / D_j)
+                                    + rho_V[i, j] * (sV / V)^2 )
 
-    returns t0 of shape (Nx, Ny)
-    """
-    ones = np.ones(h.shape[-1])
-    w = C_inv @ ones                       # C^-1 1, shape (Nx, Ny, N)
-    K = w.sum(axis=-1)                     # 1^T C^-1 1
-    return (w * (mu_P - h)).sum(axis=-1) / K
+        h       : predicted travel times, (Nx, Ny, N)
+        d_path  : path lengths D_i,       (Nx, Ny, N)
+        sigma_D : path length error,      (Nx, Ny, N)
+        D_sta   : station-station distances, (N, N)
+        returns : (Nx, Ny, N, N)
+        """
+        rho_D = 1.0                                    # bed error fully correlated between stations
+        rho_V = np.exp(-0.5 * self.D_sta**2 / self.Delta**2)     # velocity error correlated over length scale Delta
+
+        rel_D_error = self.sigma_D_arr / self.D_arr                 # sD_i / D_i
+        rel_V_error = self.sigma_V / self.V                      # sV / V
+
+        return self.__outer(self.h) * (rho_D * self.__outer(rel_D_error) + rho_V * rel_V_error**2)
 
 
-def credible_sigma(values, weights):
-    """
-    Standard deviation equivalent of the central 95% credible interval
-    (a Gaussian's 95% interval is 4 sigma wide) of a weighted 1-D distribution.
-    """
-    order = np.argsort(values)
-    values, weights = values[order], weights[order]
+    def __stack_stations(self,ds):
+        """
+        Turn an xarray Dataset (one variable per station) into one numpy array of
+        shape (Nx, Ny, N). Dims are forced to (x, y) so the grid orientation can
+        never get mixed up between the different arrays.
+        """
+        return np.stack([ds[s].transpose('x', 'y').to_numpy() for s in self.sta_lst], axis=-1)
 
-    cdf = np.cumsum(weights)
-    cdf /= cdf[-1]
 
-    inside = values[(cdf >= 0.025) & (cdf <= 0.975)]
+    def __outer(self,a):
+        """Outer product over the last axis: out[..., i, j] = a[..., i] * a[..., j]."""
+        return a[..., :, None] * a[..., None, :]
 
-    # A single grid cell holding >95% of the probability leaves nothing inside the
-    # interval: the uncertainty is then smaller than the grid spacing, so report NaN.
-    if inside.size == 0:
-        return np.nan
 
-    return (inside[-1] - inside[0]) / 4
+    def __quad_form(self,r, A):
+        """Batched quadratic form  r^T A r  for r of shape (..., N) and A of shape (..., N, N)."""
+        return (r[..., None, :] @ A @ r[..., :, None])[..., 0, 0]
+
+
+    def __profile_origin_time(self,mu_P, h, C_inv):
+        """
+        Generalised least squares estimate of the origin time t0 at every grid cell.
+
+        Minimising  (mu_P - h - t0*1)^T C^-1 (mu_P - h - t0*1)  over t0 gives
+
+            t0 = 1^T C^-1 (mu_P - h) / (1^T C^-1 1)
+
+        returns t0 of shape (Nx, Ny)
+        """
+        ones = np.ones(h.shape[-1])
+        w = C_inv @ ones                       # C^-1 1, shape (Nx, Ny, N)
+        K = w.sum(axis=-1)                     # 1^T C^-1 1
+        return (w * (mu_P - h)).sum(axis=-1) / K
+
+
+    def __credible_sigma(self,values,weights):
+        """
+        Standard deviation equivalent of the central 95% credible interval
+        (a Gaussian's 95% interval is 4 sigma wide) of a weighted 1-D distribution.
+        """
+        order = np.argsort(values)
+        values, weights = values[order], weights[order]
+
+        cdf = np.cumsum(weights)
+        cdf /= cdf[-1]
+
+        inside = values[(cdf >= 0.025) & (cdf <= 0.975)]
+
+        # A single grid cell holding >95% of the probability leaves nothing inside the
+        # interval: the uncertainty is then smaller than the grid spacing, so report NaN.
+        if inside.size == 0:
+            return np.nan
+
+        return (inside[-1] - inside[0]) / 4
+
+
+    
+
+
 
 
 # ----------------------------------------------------------------------
@@ -1188,6 +1342,86 @@ def BedScanUpdate(inv, p_picks, bed_grid, V=3900, sigma_V=100, Delta=10000,
     returns   : gamma (xarray Dataset with misfit, contour function, pdf and best-fit
                 attributes), and the covariance matrix at the best-fit cell
     """
+
+    def outer(a):
+        """Outer product over the last axis: out[..., i, j] = a[..., i] * a[..., j]."""
+        return a[..., :, None] * a[..., None, :]
+
+
+    def quad_form(r, A):
+        """Batched quadratic form  r^T A r  for r of shape (..., N) and A of shape (..., N, N)."""
+        return (r[..., None, :] @ A @ r[..., :, None])[..., 0, 0]
+
+
+    def stack_stations(ds, stations):
+        """
+        Turn an xarray Dataset (one variable per station) into one numpy array of
+        shape (Nx, Ny, N). Dims are forced to (x, y) so the grid orientation can
+        never get mixed up between the different arrays.
+        """
+        return np.stack([ds[s].transpose('x', 'y').to_numpy() for s in stations], axis=-1)
+
+
+    def travel_time_covariance(h, d_path, sigma_D, D_sta, sigma_V, V, Delta):
+        """
+        Model (distance and velocity) covariance of the predicted travel times.
+
+        With T_i = D_i / V and independent errors in D and V, first-order error
+        propagation gives  dT_i = h_i * (dD_i / D_i - dV / V),  so
+
+            C_T[i, j] = h_i h_j * ( rho_D * (sD_i / D_i) * (sD_j / D_j)
+                                    + rho_V[i, j] * (sV / V)^2 )
+
+        h       : predicted travel times, (Nx, Ny, N)
+        d_path  : path lengths D_i,       (Nx, Ny, N)
+        sigma_D : path length error,      (Nx, Ny, N)
+        D_sta   : station-station distances, (N, N)
+        returns : (Nx, Ny, N, N)
+        """
+        rho_D = 1.0                                    # bed error fully correlated between stations
+        rho_V = np.exp(-0.5 * D_sta**2 / Delta**2)     # velocity error correlated over length scale Delta
+
+        rel_D_error = sigma_D / d_path                 # sD_i / D_i
+        rel_V_error = sigma_V / V                      # sV / V
+
+        return outer(h) * (rho_D * outer(rel_D_error) + rho_V * rel_V_error**2)
+
+
+    def profile_origin_time(mu_P, h, C_inv):
+        """
+        Generalised least squares estimate of the origin time t0 at every grid cell.
+
+        Minimising  (mu_P - h - t0*1)^T C^-1 (mu_P - h - t0*1)  over t0 gives
+
+            t0 = 1^T C^-1 (mu_P - h) / (1^T C^-1 1)
+
+        returns t0 of shape (Nx, Ny)
+        """
+        ones = np.ones(h.shape[-1])
+        w = C_inv @ ones                       # C^-1 1, shape (Nx, Ny, N)
+        K = w.sum(axis=-1)                     # 1^T C^-1 1
+        return (w * (mu_P - h)).sum(axis=-1) / K
+
+
+    def credible_sigma(values, weights):
+        """
+        Standard deviation equivalent of the central 95% credible interval
+        (a Gaussian's 95% interval is 4 sigma wide) of a weighted 1-D distribution.
+        """
+        order = np.argsort(values)
+        values, weights = values[order], weights[order]
+
+        cdf = np.cumsum(weights)
+        cdf /= cdf[-1]
+
+        inside = values[(cdf >= 0.025) & (cdf <= 0.975)]
+
+        # A single grid cell holding >95% of the probability leaves nothing inside the
+        # interval: the uncertainty is then smaller than the grid spacing, so report NaN.
+        if inside.size == 0:
+            return np.nan
+
+        return (inside[-1] - inside[0]) / 4
  
     xlin = bed_grid.x.to_numpy()
     ylin = bed_grid.y.to_numpy()
@@ -1220,7 +1454,6 @@ def BedScanUpdate(inv, p_picks, bed_grid, V=3900, sigma_V=100, Delta=10000,
     # sigma_eff^2 = sigma_P^2 + sigma_floor^2
     C_t = np.diag(sigma_P**2 + sigma_floor**2)
     C_T = travel_time_covariance(h, d_path, sigma_D_path, D_sta, sigma_V, V, Delta)
- 
     C = C_t if no_model_error else C_t + C_T
     C = np.broadcast_to(C, h.shape + (N,))          # make sure it is (Nx, Ny, N, N)
  
