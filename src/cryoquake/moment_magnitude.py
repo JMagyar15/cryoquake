@@ -141,7 +141,7 @@ def FitBruneModel(f_dict,Pxx_dict,arrivals):
             results[key] = None
         else:
             t_star_est = (arrivals['R'][key] / 3870) / 30
-            x0 = [np.log(np.max(Pxx)),np.log(2),t_star_est]
+            x0 = [np.log(np.max(Pxx)),np.log(5),t_star_est]
             res = curve_fit(FullLogBruneModel,f,Pxx,p0=x0,full_output=True,nan_policy='omit')#,x_scale='jac')#,bounds=bounds)#,sigma=sigma)#,jac=BruneJacobian) 
             results[key] = res
     return results

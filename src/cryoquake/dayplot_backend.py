@@ -162,14 +162,14 @@ class StackPlot:
     
         
 
-    def make_page(self,tr_id,page_chunk):
+    def make_page(self,tr_id,page_chunk,lw=0.75):
         #set up the axes for this page
         ax = self.dayplot_axes(tr_id,page_chunk.starttime,page_chunk.endtime)
 
         #get the minmax and event streams for this page
         min_max = self.min_max[tr_id][page_chunk.str_name]
         
-        self.__plot_minmax(ax,min_max)
+        self.__plot_minmax(ax,min_max,lw=lw)
 
         self.events.setdefault(page_chunk.str_name,{})
         self.events[page_chunk.str_name].setdefault(tr_id,{})
@@ -180,7 +180,7 @@ class StackPlot:
         return self.fig, ax
 
 
-    def __plot_minmax(self,ax,extreme_values):
+    def __plot_minmax(self,ax,extreme_values,lw=0.75):
         intervals = extreme_values.shape[0]
         for i in range(intervals): #loop over the rows of the extreme values array.
             y_values = np.ma.empty(self.width_p * 2)
@@ -188,7 +188,7 @@ class StackPlot:
             # Add min and max values.
             y_values[0::2] += extreme_values[i, :, 0]
             y_values[1::2] += extreme_values[i, :, 1]
-            ax.plot(self.x_values,y_values,color='black',lw=0.75)
+            ax.plot(self.x_values,y_values,color='black',lw=lw)
 
         ax.set_xlim(0, self.width_p - 1)
         ax.set_ylim(-0.3, intervals + 0.3)
